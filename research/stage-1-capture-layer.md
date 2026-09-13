@@ -269,6 +269,55 @@ content script and flush opportunistically.
 
 ---
 
+## 7a. Phase 1.3/1.4 implementation findings (this session — real measurements, not projections)
+
+The falsifier in §7 has now actually been tested, not just proposed. Full
+numbers are in `plans/BUILD-STATUS.md`'s "Stage 1 implementation progress"
+section; the headline findings that change the picture in this log:
+
+- **The latency gate is borderline, not a clean pass or fail.** Four real
+  60-second runs: p95 = 161.7ms, 154.4ms (both over the 150ms line), 139.6ms,
+  145.6ms (both under). **Zero real drops in any run** — every click
+  resolved a real element every time; the entire gap is p95 timing, not
+  correctness. This does NOT yet meet the falsifier's stated bar for moving
+  to C#/FlaUI, and no such move has been made — flagged for a human decision
+  per CLAUDE.md's disagreement rule, with a cheaper diagnosis proposed first
+  (see below) rather than reaching for the rewrite immediately.
+- **Diagnosed likely cause: one shared UIA thread also processes
+  desktop-wide `AutomationFocusChangedEvent` traffic**, not just this
+  app's own — confirmed indirectly (a `field_value_changed` event was
+  captured from an unrelated real application mid-test, proving system-wide
+  UIA traffic reaches the same thread this capture host uses). **Proposed
+  next step, not yet applied:** the global `AutomationFocusChangedEvent`
+  subscription was only ever needed to drive UIA-subscription rescoping;
+  this session added a second, more reliable rescoping trigger (Phase 1.2's
+  `window_activated`/`EVENT_SYSTEM_FOREGROUND` signal, which doesn't depend
+  on UIA's narrower "something gained keyboard focus" semantics). Removing
+  the now-partially-redundant global focus subscription would likely cut
+  the background load competing for this thread's time, without a language
+  rewrite. Not yet tried; a recommendation, not a decision.
+- **Electron/web-hosted content blind spot, confirmed empirically, not just
+  theorised.** Microsoft Teams' native shell is visible to UIA (44 elements
+  to depth 8), but the tree bottoms out at an empty `RootWebArea` node — the
+  actual chat content is invisible without forcing Chromium's
+  `--force-renderer-accessibility` mode, which §5.1 already flagged as a
+  real CPU-cost tradeoff. This is no longer a prediction; it is a measured
+  result against a real, currently-installed Teams client.
+- **Two real, non-obvious implementation bugs worth recording for anyone
+  building on `comtypes` + UI Automation again:**
+  1. A DPI-unaware process gets Win32 coordinates virtualized while
+     `IUIAutomation::ElementFromPoint` uses real physical coordinates — on
+     any DPI-scaled display (the large majority of real Windows machines),
+     every resolved element is wrong unless the process calls
+     `SetProcessDpiAwareness` before any window/UIA call. Not mentioned in
+     the Microsoft Learn UIA docs read for this log's §2; found only by
+     testing against a real fixture app on a real scaled display.
+  2. comtypes represents a NULL COM element out-parameter as a non-`None`
+     Python object wrapping a null pointer — `is None` checks silently pass
+     it through; only a truthiness check (`if elem:`) catches it correctly.
+
+---
+
 ## 8. Open items requiring a human decision
 
 1. **Raw values vs. salted hashes — flagged under CLAUDE.md's "when you
@@ -304,3 +353,13 @@ content script and flush opportunistically.
    read. A real prior-art check before any filing needs full-text claim
    searching, ideally by a patent attorney. Nothing in this log should be
    treated as freedom-to-operate.
+6. **Phase 1.3's latency gate is borderline (see §7a) — decision needed on
+   how to proceed.** Real measurement: p95 hovers at 140-162ms against the
+   150ms gate across 4 runs (2 pass, 2 fail), with zero real drops in every
+   run. Not yet resolved. Options, none yet acted on: (a) apply the proposed
+   lighter fix first — remove the now-partially-redundant global
+   `AutomationFocusChangedEvent` subscription now that `window_activated`
+   drives rescoping too — and re-measure; (b) accept the current borderline
+   state and proceed; (c) invoke the blueprint's stated C#/FlaUI fallback.
+   I have not chosen for you, per the explicit instruction this was
+   implemented under.

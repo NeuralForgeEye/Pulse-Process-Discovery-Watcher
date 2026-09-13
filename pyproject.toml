@@ -1,0 +1,61 @@
+[project]
+name = "pulse-capture-host"
+version = "0.1.0"
+description = "Pulse Stage 1 capture host — Phase 1.1 (event schema + local event store) and Phase 1.2 (desktop action + window-context capture). See plans/stage-1-blueprint.md."
+authors = [
+    { name = "Rohith Davuluri", email = "rohithdavuluri1999@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "comtypes>=1.4.16",
+    "jsonschema>=4.26.0",
+    "psutil>=7.2.2",
+    "pyarrow>=25.0.1",
+    "pynput>=1.8.2",
+    "pywin32>=312 ; sys_platform == 'win32'",
+]
+
+[project.scripts]
+pulse-capture-host = "pulse_capture.desktop.run:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "pulse_capture"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# Windows-only ctypes/win32 code trips a few over-eager checks; revisit per-file if noisy.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.13"
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# pywin32's stubs are inconsistent; keep this off for now rather than littering
+# the desktop capture code with per-line ignores. Revisit once win32 usage stabilizes.
+disable_error_code = ["import-untyped"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "windows_only: requires a real Windows desktop session (hooks, HWNDs, message pump)",
+    "slow: exercises real timing (crash-safety subprocess kill, throughput, 30-min stability)",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pypdf>=6.18.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.7",
+]

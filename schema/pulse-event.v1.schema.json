@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pulse.internal/schema/pulse-event.v1.schema.json",
+  "title": "Pulse capture event (schema_version 1)",
+  "description": "Normative definition of one Stage 1 event record. See plans/stage-1-blueprint.md Phase 1.1 and schema/README.md. Every producer (desktop host, browser extension, clipboard watcher) must emit events that validate against this schema.",
+  "type": "object",
+  "required": [
+    "event_id",
+    "schema_version",
+    "producer",
+    "t_wall_utc",
+    "t_mono_ns",
+    "session_id",
+    "actor_id",
+    "event_type"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "description": "UUIDv7 — time-ordered, so id order approximates time order.",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "schema_version": {
+      "type": "integer",
+      "description": "Bumped on any breaking schema change. The store rejects events whose schema_version it does not support.",
+      "minimum": 1
+    },
+    "producer": {
+      "type": "string",
+      "enum": ["desktop", "browser", "clipboard"]
+    },
+    "t_wall_utc": {
+      "type": "integer",
+      "description": "Wall-clock microseconds since Unix epoch. For human reading and cross-machine joins ONLY — never used to order events."
+    },
+    "t_mono_ns": {
+      "type": "integer",
+      "description": "Monotonic nanoseconds from the producing process's monotonic clock. Valid for ordering ONLY within one session_id (a single capture-host run) until Phase 1.7's cross-session clock anchor is implemented."
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Identifies one capture-host run."
+    },
+    "actor_id": {
+      "type": "string",
+      "description": "Pseudonymous, stable per machine+user (salted hash). Never the raw username.",
+      "minLength": 1
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "click",
+        "double_click",
+        "context_click",
+        "key_shortcut",
+        "field_value_changed",
+        "text_selected",
+        "clipboard_copy",
+        "clipboard_paste",
+        "focus_changed",
+        "window_activated",
+        "window_opened",
+        "window_closed",
+        "navigation",
+        "tab_activated",
+        "app_launched",
+        "app_exited",
+        "idle_start",
+        "idle_end",
+        "capture_degraded"
+      ]
+    },
+    "app": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "process_name": {"type": ["string", "null"]},
+        "pid": {"type": ["integer", "null"]},
+        "exe_path_hash": {"type": ["string", "null"], "description": "sha256 of the executable path. Not the Vault-keyed HMAC used for sensitive content values (Phase 1.8) — a plain hash to avoid storing a raw filesystem path that may contain a username."},
+        "app_class": {"type": ["string", "null"]}
+      }
+    },
+    "window": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "hwnd_or_tab_id": {"type": ["string", "null"]},
+        "title": {"type": ["string", "null"]},
+        "url": {"type": ["string", "null"]},
+        "window_class": {"type": ["string", "null"]}
+      }
+    },
+    "element": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "automation_id": {"type": ["string", "null"]},
+        "name": {"type": ["string", "null"]},
+        "control_type": {"type": ["string", "null"]},
+        "role": {"type": ["string", "null"]},
+        "framework": {"type": ["string", "null"]},
+        "path_hash": {"type": ["string", "null"]},
+        "bounds": {"type": ["object", "null"]}
+      }
+    },
+    "content": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "value_hmac": {"type": ["string", "null"], "description": "Keyed HMAC of a normalised sensitive-identifier value. Never the cleartext value."},
+        "value_readable": {"type": ["string", "null"], "description": "Cleartext value for NON-sensitive classes only (ui_chrome, free_text after redaction). Must never co-occur with a sensitive_identifier class."},
+        "class": {
+          "type": ["string", "null"],
+          "enum": ["sensitive_identifier", "ui_chrome", "free_text", "sensitive_excluded", null]
+        },
+        "redaction_state": {"type": ["string", "null"]}
+      }
+    },
+    "sensor": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["tier", "confidence", "agreement"],
+      "properties": {
+        "tier": {"type": "string", "enum": ["t1_uia", "t2_dom", "t3_cv"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "agreement": {"type": "string", "enum": ["agree", "disagree", "single_sensor", "not_cross_checked"]},
+        "fallback_reason": {"type": ["string", "null"]}
+      }
+    },
+    "context": {
+      "type": ["array", "null"],
+      "items": {"type": "object"}
+    },
+    "link_hint": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "clipboard_seq": {"type": ["integer", "null"]},
+        "pair_id": {"type": ["string", "null"]}
+      }
+    },
+    "capture_meta": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "latency_ms": {"type": ["number", "null"]},
+        "dropped_before": {"type": ["integer", "null"]},
+        "degraded_reason": {"type": ["string", "null"]},
+        "hmac_key_generation": {"type": ["integer", "null"]}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "comment": "Rule: a sensitive_identifier value must carry value_hmac and must NOT carry value_readable.",
+      "if": {
+        "properties": {"content": {"properties": {"class": {"const": "sensitive_identifier"}}}}
+      },
+      "then": {
+        "properties": {
+          "content": {
+            "required": ["value_hmac"],
+            "properties": {"value_readable": {"type": "null"}}
+          }
+        }
+      }
+    },
+    {
+      "comment": "Rule: whenever content is present (this is a value-bearing event), sensor must be populated.",
+      "if": {
+        "properties": {"content": {"not": {"type": "null"}}},
+        "required": ["content"]
+      },
+      "then": {
+        "required": ["sensor"],
+        "properties": {"sensor": {"not": {"type": "null"}}}
+      }
+    },
+    {
+      "comment": "Rule: whenever a value_hmac is written, the capture_meta must record which key generation produced it, so a later key rotation cannot silently orphan the match.",
+      "if": {
+        "properties": {"content": {"required": ["value_hmac"], "properties": {"value_hmac": {"not": {"type": "null"}}}}},
+        "required": ["content"]
+      },
+      "then": {
+        "required": ["capture_meta"],
+        "properties": {
+          "capture_meta": {
+            "required": ["hmac_key_generation"],
+            "properties": {"hmac_key_generation": {"type": "integer"}}
+          }
+        }
+      }
+    }
+  ]
+}

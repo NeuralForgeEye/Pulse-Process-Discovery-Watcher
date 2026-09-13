@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv-managed virtual environment
+.venv/
+
+# Runtime artifacts from the capture host (never commit real capture data)
+*.db
+*.db-wal
+*.db-shm
+.pulse_state/
+
+# Local scratch space used during development
+scratch/

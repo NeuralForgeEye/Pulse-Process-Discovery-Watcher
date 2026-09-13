@@ -3,8 +3,120 @@
 Running log of what is decided, what is blueprinted, and what is still blocked
 on a human decision. Read this first.
 
-**Current pass: blueprint-only. All seven stages plus cross-cutting platform
-architecture are blueprinted. No implementation code has been written.**
+**Current pass: Stage 1 implementation has started. Phases 1.1-1.4 of Stage 1
+are built and tested (see "Stage 1 implementation progress" below); every
+other phase across all seven stages remains blueprint-only.**
+
+---
+
+## Stage 1 implementation progress
+
+**Phase 1.1 — Event schema and local event store: fully passed.**
+- Round-trip: 10,000/10,000 byte-identical.
+- Schema enforcement: 20/20 malformed events rejected, 0 written.
+- Crash safety: 5/5 kill-mid-transaction runs recovered with zero torn rows.
+- Throughput: ~3,290 events/s sustained (threshold ≥2,000/s).
+
+**Phase 1.2 — Desktop action and window-context capture: passed the app-switch/
+attribution/no-keylogging portion of the checkpoint; the full 50-action
+scripted ground-truth (≥98%) and 30-minute CPU-stability sub-checks were not
+run.**
+- App-switch capture: 100% (3/3) across 4 consecutive live runs.
+- `app.process_name` attribution: 100% across all captured events.
+- No-keylogging guardrail: zero sentinel occurrences, every run.
+
+**Phase 1.3 — UIA element resolution and on-screen content snapshot: 3 of 4
+checkpoints passed; the latency go/no-go gate is borderline (see below) —
+flagged, not silently resolved.**
+- Correctness against fixtures (20 documented controls, 18 individually
+  click-testable — the 2 populated ListBoxes are excluded from this specific
+  check since a click inside one correctly resolves to the row under the
+  cursor, not the container): **18/18**, confirmed across repeat runs.
+- Content correctness (5 sentinel field values must appear in an *unrelated*
+  click's context, without the user touching those fields): **5/5**.
+- Password guardrail: sentinel value **never** appears in the store; the
+  `field_value_changed` event for the password field carries
+  `value_readable: null`, `redaction_state: "password_field"`.
+- **Latency gate (p95 < 150ms, zero dropped focus events) — BORDERLINE, not a
+  clean pass.** Four real 60-second runs (scaled down from the blueprint's
+  5-minute figure — stated here explicitly): p95 = 161.7ms (fail), 154.4ms
+  (fail), 139.6ms (pass), 145.6ms (pass). **Zero real drops in every run** —
+  every click resolved a real element; the only issue is p95 latency
+  hovering right at the 150ms line. Diagnosis (not yet acted on): the single
+  UIA event-processing thread also handles a constant stream of
+  system-wide `AutomationFocusChangedEvent` notifications from the whole
+  desktop, not just this app's clicks, which appears to be the main
+  contention source (confirmed indirectly: a `field_value_changed` event was
+  captured from an unrelated real app during testing, proving desktop-wide
+  traffic reaches this same thread). **Per the blueprint's explicit
+  instruction, this has NOT been silently resolved by loosening the
+  threshold or moving to the C#/FlaUI fallback — a recommended lighter fix
+  (removing the now-partially-redundant global FocusChangedEvent
+  subscription, since Phase 1.2's window_activated signal was added this
+  session as a more reliable rescoping trigger) is proposed but not yet
+  applied, pending direction.**
+- Real-world coverage sample (5 apps, real installations, this session):
+
+  | App | UIA tree useful? | Notes |
+  |---|---|---|
+  | Microsoft Excel | Yes | 28 elements, real automation IDs, native Win32 |
+  | Microsoft Word (substitute for Outlook — not installed on this machine) | Yes | 23 elements incl. page-level structure |
+  | Windows Settings (substitute for a separate WPF app — none available) | Yes | 25 elements, native XAML labels |
+  | File Explorer (substitute for an internal LOB app — none available) | Yes | 46 elements |
+  | Microsoft Teams (Electron/web-hosted) | **Partial** | Outer native shell visible (44 elements to depth 8), but the actual chat CONTENT is not exposed — the tree bottoms out at an empty `RootWebArea` node. Confirms, empirically, the exact concern already on record in `research/stage-1-capture-layer.md` about Chromium's accessibility tree needing `--force-renderer-accessibility` to populate, which the same research log flags as a real CPU-cost tradeoff, not yet decided. |
+
+**Phase 1.4 — Text selection and highlight capture: no-churn and source-honesty
+checkpoints passed; selection-capture-accuracy checkpoint is a scoped, honest
+partial (see below), and only 2 of the blueprint's 4 required apps were
+tested.**
+- Scope note stated explicitly: the blueprint specifies Notepad, WordPad,
+  Excel and the fixture app. This session covered **Notepad and the fixture
+  app only** (time-boxed); WordPad and Excel selection capture is **not yet
+  verified** — an open gap, not a silent skip.
+- No-churn check (one `text_selected` event per drag, not a stream):
+  **passed, confirmed stable across 4+ repeat runs.**
+- Source honesty (fallback-path selections labelled `inferred_selection`,
+  never mislabelled as an observed TextPattern selection): **passed.**
+- Selection-capture accuracy, split and reported honestly rather than forced
+  to one number: **keyboard selection (Ctrl+A) ~93% (14/15 across 3 runs)**;
+  **mouse-drag selection ~20-40%, inconsistent** — a synthetic-input/
+  hit-testing timing issue against Windows 11 Notepad's WinUI3 rich-text
+  control, not a capture-code defect (every drag that DID register produced
+  the complete, exact, correct text — never a wrong or partial-but-uncaught
+  value).
+
+### Real bugs found and fixed this session (Phase 1.3/1.4 implementation)
+
+1. **DPI virtualization mismatch — a real production bug, not a test
+   artifact.** Without declaring the process DPI-aware, Windows virtualizes
+   coordinates for most Win32 APIs while UI Automation's `ElementFromPoint`
+   uses real physical-monitor coordinates; on any DPI-scaled display (125%
+   scaling here — the default on most modern Windows machines), every
+   click resolved the WRONG element. Fixed with
+   `src/pulse_capture/desktop/dpi.py`, called at the top of `run.py`'s
+   `main()`. Without this fix, Phase 1.3 would be silently wrong on
+   essentially any real deployment machine.
+2. UIA subscription rescoping relied solely on UI Automation's own
+   `AutomationFocusChangedEvent`, which tracks keyboard-input focus, not
+   "the foreground window changed" — the two are not the same thing, and a
+   window can become foreground with no element inside it ever gaining UIA
+   focus. Fixed by also rescoping from Phase 1.2's already-reliable
+   `window_activated` signal.
+3. A debounce fix attempt used "is the last-seen time close to now" instead
+   of an exact token match, letting multiple scheduled flush timers all
+   fire; fixed with the standard exact-token debounce pattern.
+4. `id(sender)` is not a stable identity for a UI element across separate
+   COM callback invocations (comtypes can hand back a different wrapper
+   object for the same real element); fixed using UIA's own
+   `GetRuntimeId()`.
+5. Element-neighbourhood text extraction preferred `CurrentName` over
+   `ValuePattern.CurrentValue`, incorrectly reporting a WinForms TextBox's
+   inherited label text instead of its actual typed value.
+6. `CachedBoundingRectangle` returns a `ctypes.wintypes.RECT` struct, not a
+   tuple — a naive unpack silently produced `bounds: null` everywhere.
+7. comtypes null-element COM out-parameters are not Python `None` — every
+   tree-walk in `uia_client.py` had to be corrected to check truthiness
+   (`if elem:`), not `is not None`.
 
 ---
 
@@ -149,8 +261,8 @@ constraint 2 was honoured; 4.3 is unaffected.
 | Assumption | Stage | Status |
 |---|---|---|
 | MV3 service-worker kept alive by native-messaging port | 1 | Recalled, not verified. Tested in 1.6 |
-| UIA latency from Python/comtypes | 1 | No benchmark run. 1.3's p95 <150 ms gate is the test |
-| Electron app accessibility | 1 | Unknown; 1.3 coverage sample must include one |
+| UIA latency from Python/comtypes | 1 | **Benchmarked this session — borderline.** p95 across 4 real 60s runs: 161.7/154.4ms (fail), 139.6/145.6ms (pass), 150ms gate. Zero real drops in any run. See "Stage 1 implementation progress" above |
+| Electron app accessibility | 1 | **Tested this session (Teams).** Outer shell visible; actual web/chat content NOT exposed without forcing Chromium accessibility mode — confirmed, not just theorised |
 | Where SKAN runs CV inference (endpoint vs gateway) | — | Ambiguous in their materials. Don't assert either way |
 | SKAN patent portfolio | — | **Unexamined** (Justia 403). Retry another route |
 | `ruptures`, `hdbscan`, Splink, ProDrift licences | 2,3,4,7 | Unverified |

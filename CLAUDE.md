@@ -91,10 +91,32 @@ an internal security review.
    session must be able to understand what was tried, what worked, what
    didn't, and why, without re-deriving it.
 
-9. **Maintain the three-artifact rule.** Every stage has a blueprint in
-   `plans/`, a research log in `research/`, and a plain-English walkthrough in
-   `manual-readable/`. Keep them in sync; a change to one usually needs the
-   other two updated.
+9. **MANDATORY: keep `BUILD-STATUS.md` current the moment a phase's status
+   changes.** Immediately after any phase's implementation is completed and
+   its validation checkpoint results are known — whether fully passed,
+   partially passed, or failed — update `BUILD-STATUS.md` before considering
+   the task done. This applies even if updating `BUILD-STATUS.md` wasn't
+   explicitly part of what was asked. A phase is not "finished" until
+   `BUILD-STATUS.md` accurately reflects it.
+
+   The update must include:
+   - Which phase, and its actual status (fully passed / partially passed,
+     with specifics / failed / blocked)
+   - Which validation checkpoints actually ran, and which are still pending —
+     never mark a checkpoint "passed" if only part of it was executed
+   - Any open questions or risks raised during the work
+
+   If a task in a session isn't primarily about implementing a phase (e.g.
+   writing a document, answering a question, doing research) but incidentally
+   reveals that `BUILD-STATUS.md` is now inaccurate or stale, flag this
+   explicitly and ask before proceeding — do not silently leave a known-stale
+   status file in place, and do not silently fix it either without confirming
+   the correction is accurate.
+
+10. **Maintain the three-artifact rule.** Every stage has a blueprint in
+    `plans/`, a research log in `research/`, and a plain-English walkthrough in
+    `manual-readable/`. Keep them in sync; a change to one usually needs the
+    other two updated.
 
 ---
 
