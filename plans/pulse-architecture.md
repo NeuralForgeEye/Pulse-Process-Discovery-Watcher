@@ -1,5 +1,13 @@
 # Pulse — Architecture Plan
-### (A metadata-based process discovery watcher — no OCR, no video)
+### (A structure-first process discovery watcher — metadata where it exists, vision only where it doesn't)
+
+> **Subtitle changed from "no OCR, no video".** Research into SKAN's actual
+> architecture showed that a purely metadata-based tool cannot see Citrix, VDI
+> or mainframe surfaces — where a large share of regulated QA/QC work happens.
+> Pulse now commits to **tiered sensing**: exact structural reads wherever the
+> accessibility layer or DOM provides them, computer vision **only** where no
+> structural layer exists, and every captured value permanently tagged with
+> which sensor produced it. See "Decisions that shape this plan" below.
 
 ## What this is, in one paragraph
 
@@ -23,6 +31,67 @@ different applications relate to each other within that one task, then find
 the repeating pattern across many tasks, then label what kind of process it
 is, then produce the final output, then optionally keep it current over
 time.
+
+---
+
+## Decisions that shape this plan
+
+Taken after researching the competitive landscape and the deployment context.
+Detail lives in `plans/platform-architecture.md`; evidence in
+`research/deployment-sensing-and-data-controls.md`.
+
+**1. Deployment: internal to Wells Fargo.** Pulse is an internal tool, not a
+product sold to third parties. Data never crosses an organisational boundary —
+but the controls external vendors must satisfy still define our internal bar.
+The target shape is clustered and multi-datacenter, serving a large internal
+audience.
+
+**2. Sensing: tiered and arbitrated.** Accessibility layer (T1) and DOM (T2)
+give *exact* values and semantic field identity. Computer vision (T3) is used
+**only** on surfaces with no structural layer — Citrix, VDI, mainframe,
+canvas-rendered applications. An arbitration policy picks the cheapest
+sufficient sensor per surface.
+
+**3. Provenance tagging is mandatory.** Every captured value carries which
+sensor produced it and that sensor's confidence. **Values of different
+provenance are never silently merged.** Where two sensors observe the same
+identifier, agreement raises confidence and **disagreement is flagged, never
+averaged**. This is what allows accuracy to be stated honestly per surface
+instead of hidden inside a blended number.
+
+**4. Identifiers are hashed at the point of capture.** Keyed HMAC, key from
+the internal Vault, normalised before hashing so formatting variants still
+match. Cleartext identifiers never enter the pipeline. Structural and
+procedural text — field names, button labels, screen titles — **stays
+readable**, because Stages 4 and 5 must read it and hashing it would buy no
+security. A separate, narrowly-scoped, fully audited reversal vault exists for
+the rare case a human reviewer must see a real value.
+
+**5. Federation is the default posture for data sharing** — keep data local per
+business unit / datacenter; share only pattern-level summaries centrally.
+**One deliberate exception:** Stage 4's mining corpus is currently assumed to be
+a single pooled set of HMAC-hashed identifiers. That assumption is **not
+confirmed by data governance/InfoSec** — it is a working path, with the
+federated local-mine-then-merge designs retained as the fallback. See the OPEN
+GOVERNANCE ITEM in `plans/platform-architecture.md` §5.3.
+
+**6. The architecture is environment-agnostic.** Storage, secrets and sensing
+sit behind interfaces; moving from a development machine to the bank's
+infrastructure is a configuration change, not a rewrite. Containerised from the
+start so the shape matches the eventual clustered deployment.
+
+**7. Four differentiators, treated as one capability.** Sensing-tier
+arbitration · field-pair relationship graph · evidence-graded output ·
+capture-health self-awareness. Everything built should strengthen at least one.
+
+**A correction to Stage 0's framing.** Prior-art research found that
+metadata-only capture already ships commercially (Paxray, KYP.ai), that
+clipboard source→destination tracking is covered by endpoint DLP patents, and
+that SKAN keeps raw capture inside the customer network too — so "no video" is
+a weaker privacy differentiator than this plan originally assumed. The honest
+distinctive claim is the **combination** in point 7, not any single mechanism.
+See `research/stage-1-capture-layer.md` §6 and
+`research/stage-3-cross-application-linking.md` §6.
 
 ---
 
@@ -73,15 +142,25 @@ application in view — not a short fixed list, a genuinely wide net.
    value that was copied and where it was later pasted.
 4. Also capture the **actual text content visible on screen** at the moment
    of each action — pulled from the application's own internal structure
-   (a browser's DOM, or Windows' accessibility layer), not from a picture of
-   the screen. This means we can often know what a field displayed even if
-   the person never clicked or copied it.
+   (a browser's DOM, or Windows' accessibility layer) wherever that structure
+   exists, and **only where it does not** (Citrix, VDI, mainframe, canvas
+   apps) from a visual reading of the screen. This means we can often know
+   what a field displayed even if the person never clicked or copied it.
 5. Tag every captured event with which application and window it happened
    in, and the exact time, so events from different applications can later
    be placed on one shared timeline per person, per session.
-6. Checkpoint: for one person working continuously across multiple
+6. **Tag every captured value with the sensor that produced it** — structural
+   read or visual inference — and that sensor's confidence. Values of
+   different provenance are never merged; where both sensors see the same
+   value, agreement strengthens it and disagreement is flagged.
+7. **Hash sensitive identifiers at the moment of capture** (keyed HMAC,
+   normalised first), so cleartext never enters the pipeline, while leaving
+   structural text — labels, titles, button captions — readable for later
+   stages.
+8. Checkpoint: for one person working continuously across multiple
    applications, we can produce one unbroken, ordered timeline of everything
-   meaningful they did, with no gaps and no reliance on watching the screen.
+   meaningful they did, with no gaps, with every value carrying its
+   provenance, and with no sensitive identifier stored in the clear.
 
 ---
 
@@ -232,15 +311,33 @@ we're positioned to notice when a real-world process quietly changes.
 
 ---
 
-## What comes next (honest next step, not part of this plan)
+## What comes next — status update
 
-Once this plan is agreed on, the next phase is investigation, not
-construction: for each stage, check what already exists in the open-source
-world (capture techniques, process-mining libraries and algorithms,
-labeling approaches) that can be reused or adapted, and design something
-fully new only where nothing suitable already exists. Stage 3 (cross-
-application linking through identifier and copy/paste evidence) is the
-piece least likely to already exist off-the-shelf, since most process-mining
-tools assume a single system's event log rather than signals scattered
-across several unrelated applications — that is the most promising place to
-look for a genuinely new, defensible invention.
+The investigation this section called for **has been done**. Every stage now
+has a blueprint (`plans/stage-N-blueprint.md`), a research log
+(`research/`), and a plain-English walkthrough (`manual-readable/`).
+`plans/BUILD-STATUS.md` is the index of what is decided and what is open.
+
+**What the investigation changed in this plan's expectations:**
+
+- The prediction that Stage 3 is "least likely to already exist off-the-shelf"
+  was **partly wrong**. Endpoint DLP products already track a copied value from
+  source application to destination application *with the content*, and Leno et
+  al. (2020) published discovery of cross-application data transfers from UI
+  logs. Tier-1 copy/paste evidence is not new.
+- What does appear to remain is narrower and more specific: **promoting
+  individually inadmissible evidence by recurrence of the same field-pair
+  relationship across a population of episodes** — combined with the tiered
+  sensing, evidence grading and capture-health awareness listed above. This is
+  a combination claim, which is the weakest kind, and **no patent claim text
+  has been read** — only summaries. It is not clearance.
+- Two additions were made to this plan and are reflected in the blueprints:
+  **event abstraction** as an explicit phase in Stage 4 (turning raw UI events
+  into named process activities — a hard problem the original plan stepped
+  over), and **capture-health monitoring** pulled forward from Stage 7 into v1,
+  because sensing degradation otherwise corrupts every earlier stage silently.
+
+**What is still genuinely open** is listed in `plans/BUILD-STATUS.md`. The two
+most consequential: federated Stage 4 mining is unsolved, and the freedom-to-
+operate question on the DLP clipboard patents needs internal IP counsel —
+internal use is not exempt from infringement under US law.
