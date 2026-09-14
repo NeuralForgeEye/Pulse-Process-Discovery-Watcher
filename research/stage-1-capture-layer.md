@@ -275,27 +275,27 @@ The falsifier in §7 has now actually been tested, not just proposed. Full
 numbers are in `plans/BUILD-STATUS.md`'s "Stage 1 implementation progress"
 section; the headline findings that change the picture in this log:
 
-- **The latency gate is borderline, not a clean pass or fail.** Four real
+- **The latency gate: initially borderline, then fixed and re-measured —
+  PASSED, no C#/FlaUI fallback needed.** First measurement, four real
   60-second runs: p95 = 161.7ms, 154.4ms (both over the 150ms line), 139.6ms,
-  145.6ms (both under). **Zero real drops in any run** — every click
-  resolved a real element every time; the entire gap is p95 timing, not
-  correctness. This does NOT yet meet the falsifier's stated bar for moving
-  to C#/FlaUI, and no such move has been made — flagged for a human decision
-  per CLAUDE.md's disagreement rule, with a cheaper diagnosis proposed first
-  (see below) rather than reaching for the rewrite immediately.
-- **Diagnosed likely cause: one shared UIA thread also processes
-  desktop-wide `AutomationFocusChangedEvent` traffic**, not just this
-  app's own — confirmed indirectly (a `field_value_changed` event was
-  captured from an unrelated real application mid-test, proving system-wide
-  UIA traffic reaches the same thread this capture host uses). **Proposed
-  next step, not yet applied:** the global `AutomationFocusChangedEvent`
-  subscription was only ever needed to drive UIA-subscription rescoping;
-  this session added a second, more reliable rescoping trigger (Phase 1.2's
-  `window_activated`/`EVENT_SYSTEM_FOREGROUND` signal, which doesn't depend
-  on UIA's narrower "something gained keyboard focus" semantics). Removing
-  the now-partially-redundant global focus subscription would likely cut
-  the background load competing for this thread's time, without a language
-  rewrite. Not yet tried; a recommendation, not a decision.
+  145.6ms (both under), with **zero real drops in any run** — every click
+  resolved a real element every time; the entire gap was p95 timing, not
+  correctness. Diagnosed cause: one shared UIA thread was also processing
+  desktop-wide `AutomationFocusChangedEvent` traffic, not just this app's
+  own (confirmed indirectly — a `field_value_changed` event was captured
+  from an unrelated real application mid-test, proving system-wide UIA
+  traffic reached this same thread). **Fix applied and confirmed**: the
+  global `AutomationFocusChangedEvent` subscription was only ever needed to
+  drive rescoping, and this session had already added a second, more
+  reliable rescoping trigger (Phase 1.2's `window_activated` signal, which
+  doesn't depend on UIA's narrower "something gained keyboard focus"
+  semantics) — so the global subscription was removed entirely rather than
+  kept alongside it. Re-measured with 4 fresh 60-second runs: p95 = 138.4ms,
+  142.1ms, 129.6ms, 143.9ms — all comfortably under 150ms, zero drops in
+  every run. This never met the falsifier's stated bar for moving to
+  C#/FlaUI, and no such move was made; the fix was a contention/
+  architecture correction, not evidence the Python/comtypes UIA path itself
+  is too slow.
 - **Electron/web-hosted content blind spot, confirmed empirically, not just
   theorised.** Microsoft Teams' native shell is visible to UIA (44 elements
   to depth 8), but the tree bottoms out at an empty `RootWebArea` node — the
@@ -353,13 +353,17 @@ section; the headline findings that change the picture in this log:
    read. A real prior-art check before any filing needs full-text claim
    searching, ideally by a patent attorney. Nothing in this log should be
    treated as freedom-to-operate.
-6. **Phase 1.3's latency gate is borderline (see §7a) — decision needed on
-   how to proceed.** Real measurement: p95 hovers at 140-162ms against the
-   150ms gate across 4 runs (2 pass, 2 fail), with zero real drops in every
-   run. Not yet resolved. Options, none yet acted on: (a) apply the proposed
-   lighter fix first — remove the now-partially-redundant global
-   `AutomationFocusChangedEvent` subscription now that `window_activated`
-   drives rescoping too — and re-measure; (b) accept the current borderline
-   state and proceed; (c) invoke the blueprint's stated C#/FlaUI fallback.
-   I have not chosen for you, per the explicit instruction this was
-   implemented under.
+6. ~~Phase 1.3's latency gate is borderline — decision needed on how to
+   proceed.~~ **Resolved.** The proposed lighter fix (remove the global
+   `AutomationFocusChangedEvent` subscription, rely solely on
+   `window_activated` for rescoping) was applied and re-measured: 4 fresh
+   60-second runs all passed comfortably (p95 = 138.4/142.1/129.6/143.9ms,
+   zero drops). No C#/FlaUI fallback needed. See §7a for the full numbers.
+7. **Phase 1.4's mouse-drag selection-capture rate (~20-40%) is not yet
+   confirmed as a synthetic-input artifact.** The explanation on record —
+   real hit-testing/timing mismatch between scripted `SendInput` dragging
+   and Windows 11 Notepad's WinUI3 rich-text control, not a capture-code
+   defect — is well-supported (every drag that DID register produced exact,
+   correct text) but has **not been verified with a real human dragging a
+   real mouse**. Needed before this attribution is fully trusted; tracked
+   as an open item in `plans/BUILD-STATUS.md`.

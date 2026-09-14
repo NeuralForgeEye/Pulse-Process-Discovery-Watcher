@@ -1,7 +1,19 @@
 """Phase 1.3 build step 3 + Phase 1.4: UIA event subscriptions, owned by one
-dedicated STA thread -- ``AutomationFocusChangedEvent``,
-``AutomationPropertyChangedEvent`` on ``ValuePattern.Value``, a narrowly
-scoped ``StructureChangedEvent``, and (Phase 1.4) ``TextSelectionChangedEvent``.
+dedicated STA thread -- ``AutomationPropertyChangedEvent`` on
+``ValuePattern.Value``, a narrowly scoped ``StructureChangedEvent``, and
+(Phase 1.4) ``TextSelectionChangedEvent``, all rescoped to the current
+foreground window whenever Phase 1.2's window_activated signal fires (see
+``notify_foreground_changed``).
+
+An earlier version also registered UIA's own global
+``AutomationFocusChangedEvent`` as a second rescoping trigger. Removed: it
+tracks a narrower thing (keyboard-input focus moving to a specific element,
+not "the foreground window changed"), and because it is necessarily
+desktop-wide, it fired constantly from unrelated applications and competed
+with this thread's on-demand snapshot work -- a measured contributor to the
+Phase 1.3 latency gate landing right at its boundary. See
+``notify_foreground_changed``'s docstring and `research/stage-1-capture-
+layer.md` §7a for the before/after numbers.
 
 Why one thread owns all of it: COM interface pointers created in an STA are
 apartment-affine, and Microsoft's own UIA docs warn against adding/removing
@@ -111,7 +123,6 @@ class UiaResolverThread:
         self._ctx: uc.UiaContext | None = None
         self._scoped_hwnd: int = 0
 
-        self._focus_handler: Any = None
         self._property_handler: Any = None
         self._structure_handler: Any = None
         self._text_selection_handler: Any = None
@@ -155,7 +166,13 @@ class UiaResolverThread:
         self._win_thread_id = kernel32.GetCurrentThreadId()
         try:
             self._ctx = uc.UiaContext()
-            self._register_focus_handler()
+            # Establish an initial scope from whatever has focus at
+            # startup. Ongoing rescoping is driven entirely by
+            # notify_foreground_changed (Phase 1.2's window_activated
+            # signal) -- see the removed AutomationFocusChangedEvent note
+            # below for why that replaced UIA's own focus-change event
+            # rather than supplementing it.
+            self._rescope_if_needed(win32gui.GetForegroundWindow())
         finally:
             self._ready.set()  # unblock start() either way; failures surface as "everything degraded"
 
@@ -192,16 +209,24 @@ class UiaResolverThread:
         (SetWinEventHook's EVENT_SYSTEM_FOREGROUND), which is proven
         reliable across this whole session's testing.
 
-        This exists ALONGSIDE (not instead of) UIA's own
-        AutomationFocusChangedEvent because that event tracks a narrower
-        thing than "the foreground window changed" -- it fires when
-        keyboard-input focus moves to a specific element, which is not
-        guaranteed to happen just because a window becomes foreground
-        (confirmed by testing: forcing a window to the foreground with no
-        real keyboard interaction inside it left the UIA thread scoped to
-        whatever window last held actual UI Automation focus, sometimes
-        an unrelated app, indefinitely). Reusing Phase 1.2's own
-        already-reliable foreground signal closes that gap.
+        This is now the ONLY rescoping trigger. An earlier version also
+        registered UIA's own global AutomationFocusChangedEvent, kept
+        alongside this one -- removed after two things became clear by
+        testing: (1) it is the wrong signal anyway, since it tracks
+        keyboard-input focus moving to a specific element, not "the
+        foreground window changed" (forcing a window to the foreground
+        with no real keyboard interaction inside it left the UIA thread
+        scoped to whatever window last held actual UI Automation focus,
+        sometimes indefinitely); and (2) because it is registered
+        globally (desktop-wide, not just this app), it fires constantly
+        from completely unrelated applications the user is also using,
+        and every firing runs on this SAME single UIA thread that also
+        has to service on-demand snapshot requests -- a real, measured
+        contributor to the Phase 1.3 latency gate landing right at its
+        150ms boundary rather than comfortably under it. Removing it and
+        relying solely on the reliable, app-scoped window_activated
+        signal both fixes the wrong-signal problem and removes that
+        background load.
         """
         if self._win_thread_id is None:
             return
@@ -247,19 +272,7 @@ class UiaResolverThread:
         latency_ms = (time.monotonic() - start) * 1000.0
         return uc.SnapshotResult(element=snap, context=context, degraded=degraded, degraded_reason=reason, latency_ms=latency_ms)
 
-    # -- focus-driven rescoping ----------------------------------------------
-
-    def _register_focus_handler(self) -> None:
-        assert self._ctx is not None
-        self._focus_handler = _FocusHandler(self._on_focus_changed)
-        self._ctx.uia.AddFocusChangedEventHandler(self._ctx.cache_request, self._focus_handler)
-        # Establish an initial scope from whatever has focus right now,
-        # rather than waiting for the first focus change.
-        self._rescope_if_needed(win32gui.GetForegroundWindow())
-
-    def _on_focus_changed(self, _sender: Any) -> None:
-        with contextlib.suppress(Exception):
-            self._rescope_if_needed(win32gui.GetForegroundWindow())
+    # -- foreground-driven rescoping ------------------------------------------
 
     def _rescope_if_needed(self, foreground_hwnd: int) -> None:
         assert self._ctx is not None
@@ -318,9 +331,6 @@ class UiaResolverThread:
         if self._ctx is None:
             return
         self._unregister_scoped_handlers()
-        if self._focus_handler is not None:
-            with contextlib.suppress(Exception):
-                self._ctx.uia.RemoveFocusChangedEventHandler(self._focus_handler)
         with contextlib.suppress(Exception):
             self._ctx.uia.RemoveAllEventHandlers()
 
@@ -583,19 +593,6 @@ def snapshot_result_to_event_fields(result: uc.SnapshotResult) -> dict[str, Any]
 # -- COM event handler shims -------------------------------------------------
 # Each wraps a plain Python callback so uia_events.py's own methods (which
 # need `self`) don't have to be COM interface implementations themselves.
-
-
-class _FocusHandler(COMObject):
-    _com_interfaces_ = [UIA.IUIAutomationFocusChangedEventHandler]
-
-    def __init__(self, callback: Callable[[Any], None]) -> None:
-        super().__init__()
-        self._callback = callback
-
-    def IUIAutomationFocusChangedEventHandler_HandleFocusChangedEvent(self, sender: Any) -> int:
-        with contextlib.suppress(Exception):
-            self._callback(sender)
-        return 0
 
 
 class _PropertyChangedHandler(COMObject):

@@ -12,7 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pulse_capture.store import SQLiteEventStore
@@ -21,7 +21,20 @@ _COLLAPSE_TYPES = {"focus_changed"}  # noisy, low-signal for a first read
 
 
 def _local_time(t_wall_utc_us: int) -> str:
-    return datetime.fromtimestamp(t_wall_utc_us / 1e6, tz=timezone.utc).astimezone().strftime("%H:%M:%S.%f")[:-3]
+    return datetime.fromtimestamp(t_wall_utc_us / 1e6, tz=UTC).astimezone().strftime("%H:%M:%S.%f")[:-3]
+
+
+def _content_preview(event: dict, max_chars: int = 70) -> str:
+    content = event.get("content") or {}
+    if content.get("redaction_state") == "password_field":
+        return "(password -- never captured)"
+    text = content.get("value_readable")
+    if not text:
+        return "(empty)"
+    text = " ".join(text.split())  # collapse newlines/whitespace for one-line display
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
+    return f'"{text}"'
 
 
 def _describe(event: dict) -> str:
@@ -43,6 +56,16 @@ def _describe(event: dict) -> str:
         return f"{process} -- {title or '(no title)'}  [{event_type}]"
     if event_type == "key_shortcut":
         return f"{process} -- {title or '(no title)'}  [shortcut]"
+    if event_type == "text_selected":
+        element = event.get("element") or {}
+        source = (event.get("sensor") or {}).get("fallback_reason") or "observed"
+        return f"{process} -- {title or '(no title)'}  [text_selected, {source}] {_content_preview(event)} (field: {element.get('automation_id') or element.get('name') or '?'})"
+    if event_type == "field_value_changed":
+        element = event.get("element") or {}
+        return f"{process} -- {title or '(no title)'}  [field_value_changed] {_content_preview(event)} (field: {element.get('automation_id') or element.get('name') or '?'})"
+    if event_type == "capture_degraded":
+        meta = event.get("capture_meta") or {}
+        return f"[capture_degraded: {meta.get('degraded_reason') or 'unknown reason'}]"
     if event_type in ("idle_start", "idle_end"):
         return f"[{event_type}]"
     return f"{process} -- {title}  [{event_type}]"

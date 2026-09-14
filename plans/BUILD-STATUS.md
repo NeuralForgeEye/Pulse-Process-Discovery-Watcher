@@ -25,9 +25,8 @@ run.**
 - `app.process_name` attribution: 100% across all captured events.
 - No-keylogging guardrail: zero sentinel occurrences, every run.
 
-**Phase 1.3 — UIA element resolution and on-screen content snapshot: 3 of 4
-checkpoints passed; the latency go/no-go gate is borderline (see below) —
-flagged, not silently resolved.**
+**Phase 1.3 — UIA element resolution and on-screen content snapshot: FULLY
+PASSED — all 4 checkpoints.**
 - Correctness against fixtures (20 documented controls, 18 individually
   click-testable — the 2 populated ListBoxes are excluded from this specific
   check since a click inside one correctly resolves to the row under the
@@ -37,24 +36,28 @@ flagged, not silently resolved.**
 - Password guardrail: sentinel value **never** appears in the store; the
   `field_value_changed` event for the password field carries
   `value_readable: null`, `redaction_state: "password_field"`.
-- **Latency gate (p95 < 150ms, zero dropped focus events) — BORDERLINE, not a
-  clean pass.** Four real 60-second runs (scaled down from the blueprint's
-  5-minute figure — stated here explicitly): p95 = 161.7ms (fail), 154.4ms
-  (fail), 139.6ms (pass), 145.6ms (pass). **Zero real drops in every run** —
-  every click resolved a real element; the only issue is p95 latency
-  hovering right at the 150ms line. Diagnosis (not yet acted on): the single
-  UIA event-processing thread also handles a constant stream of
-  system-wide `AutomationFocusChangedEvent` notifications from the whole
-  desktop, not just this app's clicks, which appears to be the main
-  contention source (confirmed indirectly: a `field_value_changed` event was
-  captured from an unrelated real app during testing, proving desktop-wide
-  traffic reaches this same thread). **Per the blueprint's explicit
-  instruction, this has NOT been silently resolved by loosening the
-  threshold or moving to the C#/FlaUI fallback — a recommended lighter fix
-  (removing the now-partially-redundant global FocusChangedEvent
-  subscription, since Phase 1.2's window_activated signal was added this
-  session as a more reliable rescoping trigger) is proposed but not yet
-  applied, pending direction.**
+- **Latency gate (p95 < 150ms, zero dropped focus events) — PASSED, after a
+  real fix.** Initial measurement was borderline (2 of 4 runs over 150ms:
+  161.7ms, 154.4ms; 2 under: 139.6ms, 145.6ms), diagnosed as contention from
+  UI Automation's global `AutomationFocusChangedEvent` firing constantly
+  from unrelated desktop-wide activity on the same single UIA thread that
+  also services on-demand snapshot requests. **Fix applied**: removed that
+  global subscription entirely; UIA rescoping now runs solely from Phase
+  1.2's own reliable `window_activated` signal (`notify_foreground_changed`
+  in `uia_events.py`), which is app-scoped, not desktop-wide. Re-measured
+  with 4 fresh 60-second runs, all passing comfortably:
+
+  | Run | p95 | Context-truncated (element OK, neighbourhood walk hit its 120ms budget) | Dropped (no element at all) |
+  |---|---|---|---|
+  | 1 | **138.4ms** | 4/122 | 0/122 |
+  | 2 | **142.1ms** | 6/122 | 0/122 |
+  | 3 | **129.6ms** | 0/122 | 0/122 |
+  | 4 | **143.9ms** | 9/122 | 0/122 |
+
+  All 4 comfortably under the 150ms gate; zero real drops in any run, same
+  as before the fix. No C#/FlaUI fallback was needed — the fix was a
+  contention/architecture correction (a wrong, overly-broad event
+  subscription), not a limitation of the Python/comtypes UIA path itself.
 - Real-world coverage sample (5 apps, real installations, this session):
 
   | App | UIA tree useful? | Notes |
@@ -85,6 +88,16 @@ tested.**
   the complete, exact, correct text — never a wrong or partial-but-uncaught
   value).
 
+  **⚠️ Open item: this attribution is not yet confirmed.** The ~20-40% mouse-
+  drag figure was produced entirely by scripted `SendInput` synthetic
+  dragging, and the "it's a synthetic-input timing artifact, not a real
+  capture defect" explanation is the most likely one given the evidence
+  (every registered drag captured exact, correct text — never wrong or
+  corrupted), but it has **not been verified with a real human dragging a
+  real mouse**. That verification pass is still needed before this
+  attribution is fully trusted — do not treat mouse-drag selection as
+  "known good" until someone has actually tried it by hand.
+
 ### Real bugs found and fixed this session (Phase 1.3/1.4 implementation)
 
 1. **DPI virtualization mismatch — a real production bug, not a test
@@ -100,8 +113,12 @@ tested.**
    `AutomationFocusChangedEvent`, which tracks keyboard-input focus, not
    "the foreground window changed" — the two are not the same thing, and a
    window can become foreground with no element inside it ever gaining UIA
-   focus. Fixed by also rescoping from Phase 1.2's already-reliable
-   `window_activated` signal.
+   focus. First fixed by also rescoping from Phase 1.2's already-reliable
+   `window_activated` signal; then, once the latency gate showed the global
+   focus-change subscription was itself contending for the same UIA thread
+   with unrelated desktop-wide traffic, **removed entirely** — rescoping now
+   runs solely from `window_activated`, which fixed both the correctness gap
+   and the latency contention in one change.
 3. A debounce fix attempt used "is the last-seen time close to now" instead
    of an exact token match, letting multiple scheduled flush timers all
    fire; fixed with the standard exact-token debounce pattern.
