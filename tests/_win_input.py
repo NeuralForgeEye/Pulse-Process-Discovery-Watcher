@@ -112,6 +112,23 @@ def key_up(vk: int) -> None:
     _send(_INPUT(INPUT_KEYBOARD, _INPUT_UNION(ki=_KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, None))))
 
 
+KEYEVENTF_UNICODE = 0x0004
+
+
+def type_text(text: str, delay_s: float = 0.02) -> None:
+    """Type arbitrary Unicode text via SendInput's KEYEVENTF_UNICODE flag --
+    injects each character directly rather than mapping to virtual-key
+    codes, needed for controls with no ValuePattern (e.g. Excel's formula
+    bar) where SetValue() isn't an option and real keystrokes are the only
+    way to put content in.
+    """
+    for ch in text:
+        code = ord(ch)
+        _send(_INPUT(INPUT_KEYBOARD, _INPUT_UNION(ki=_KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, None))))
+        _send(_INPUT(INPUT_KEYBOARD, _INPUT_UNION(ki=_KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, None))))
+        time.sleep(delay_s)
+
+
 def select_all(settle_s: float = 0.4) -> None:
     key_down(VK_CONTROL)
     key_down(VK_A)
@@ -146,13 +163,24 @@ def force_foreground(hwnd: int) -> None:
     a well-known, harmless workaround, not a real keypress the user asked
     for; used here only to let the TEST DRIVER bring a fixture window to
     the front, same spirit as the rest of this module.
+
+    Real bug, found by testing against Excel: the Alt tap is also the
+    keyboard shortcut that activates Office's ribbon "KeyTips" overlay
+    (the small lettered badges shown over ribbon buttons). Once active,
+    subsequent keystrokes -- including a following Ctrl+N -- get consumed
+    as KeyTip selectors instead of running as normal shortcuts, so nothing
+    the caller does next behaves as expected until it's dismissed. Escape
+    clears it; harmless to send even when no such overlay is showing.
     """
     key_down(0x12)  # VK_MENU (Alt)
     key_up(0x12)
     time.sleep(0.05)
     with contextlib.suppress(Exception):
         user32.SetForegroundWindow(hwnd)
-    time.sleep(0.2)
+    time.sleep(0.1)
+    key_down(0x1B)  # VK_ESCAPE -- dismiss any KeyTips overlay the Alt tap triggered
+    key_up(0x1B)
+    time.sleep(0.1)
 
 
 def select_to_end_of_line(settle_s: float = 0.4) -> None:

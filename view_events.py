@@ -89,6 +89,16 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         store.close()
 
+    # store.read_range orders by t_mono_ns, which the schema is explicit is
+    # only valid for ordering WITHIN one session_id (a monotonic clock
+    # resets across separate capture-host runs). This file accumulates
+    # events across many runs over days, so re-sort by t_wall_utc -- the
+    # field the schema designates "for human reading... across sessions" --
+    # or old and new sessions interleave in an arbitrary order. Found by
+    # testing: without this, --last N could surface a much older session's
+    # events ahead of ones from five minutes ago.
+    events.sort(key=lambda e: e["t_wall_utc"])
+
     type_filter = set(args.type.split(",")) if args.type else None
 
     rows = []

@@ -25,14 +25,41 @@ run.**
 - `app.process_name` attribution: 100% across all captured events.
 - No-keylogging guardrail: zero sentinel occurrences, every run.
 
-**Phase 1.3 — UIA element resolution and on-screen content snapshot: FULLY
-PASSED — all 4 checkpoints.**
+**Phase 1.3 — UIA element resolution and on-screen content snapshot: content-
+correctness's CPU-load sensitivity is now FIXED and confirmed under real,
+repeated load. The latency gate needs a clean re-measurement (see below) —
+today's re-checks were too inconsistent to trust, for reasons that don't
+look like a regression from this fix, but that isn't proven either.**
 - Correctness against fixtures (20 documented controls, 18 individually
   click-testable — the 2 populated ListBoxes are excluded from this specific
   check since a click inside one correctly resolves to the row under the
   cursor, not the container): **18/18**, confirmed across repeat runs.
-- Content correctness (5 sentinel field values must appear in an *unrelated*
-  click's context, without the user touching those fields): **5/5**.
+- **Content correctness — FIXED.** Previously: missed 1-2 of 5 sentinel
+  fields in 4 of 5 runs under real CPU load (63-91%, via `Get-Counter`).
+  Root cause: `build_context_snapshot`'s 120ms budget truncated the
+  sibling walk before reaching later-ordered fields under contention.
+  **Real fix, arrived at after two false starts** (documented in full in
+  `uia_client.py`'s docstring and `research/stage-1-capture-layer.md`):
+  1. First tried batching the whole neighbourhood walk via UIA's
+     `*BuildCache` tree-walker calls (matching blueprint step 2's caching
+     discipline). Fixed completeness but INCREASED latency (~140ms →
+     ~172ms) — a `*BuildCache` walker step carries a real fixed per-step
+     cost regardless of how much is cached.
+  2. Tried a lighter, walk-scoped cache request (4 properties instead of
+     9) — same ~171ms; confirmed the tax was the BuildCache mechanism
+     itself, not batch size.
+  3. **Landed on**: stay with the plain (uncached) walker for stepping,
+     and cut the NUMBER of live property calls per sibling instead — a
+     single-property identity check (AutomationId only, not the previous
+     two-property check) and never fetching both Name and Value for the
+     same sibling. Also fixed a real bug found along the way: caching a
+     pattern's AVAILABILITY (`AddPattern`) does not cache the pattern's
+     own sub-properties (e.g. Value) — `UIA_ValueValuePropertyId` must be
+     requested separately, or `.CachedValue` raises `E_INVALIDARG`.
+  **Confirmed under real, repeated, artificially-induced CPU load** (a
+  genuine 6-thread PowerShell busy-loop, not a guess): 5/5 sentinel fields
+  found across 4 separate runs at 60-80% measured CPU load, plus a clean
+  5/5 at normal load. This is a real, reproduced fix, not a one-off.
 - Password guardrail: sentinel value **never** appears in the store; the
   `field_value_changed` event for the password field carries
   `value_readable: null`, `redaction_state: "password_field"`.
@@ -58,6 +85,25 @@ PASSED — all 4 checkpoints.**
   as before the fix. No C#/FlaUI fallback was needed — the fix was a
   contention/architecture correction (a wrong, overly-broad event
   subscription), not a limitation of the Python/comtypes UIA path itself.
+
+  **⚠️ Needs a clean re-measurement — today's re-checks were too noisy to
+  trust, in either direction.** While confirming the content-correctness
+  fix above (a separate, unrelated code path) on the same session, this
+  gate was re-run several more times and swung wildly: 200.9ms, then
+  2095.4ms, then briefly 20028.5ms with 17 real drops on one run, measured
+  with system CPU checked immediately before each run ranging from 23% to
+  85%+ with no clean correlation to the result. That 20-second run
+  coincided with "Memory Compression" active at ~900MB and elevated paging
+  — a real, observed system event, not invented — most likely from this
+  session's own accumulated footprint (many hours, many repeated
+  CaptureHost starts/stops and app launches/kills across Phase 1.3/1.4
+  testing today). **This does not touch the content-correctness fix above,
+  which was verified separately and repeatedly under controlled, measured
+  load.** But it means the clean 4-run table above (138-144ms) should be
+  treated as **not yet re-confirmed after today's code changes** — the
+  honest state is "last known good, needs a fresh check on a rested
+  machine," not "still passing." Do not treat this gate as settled until
+  that recheck happens.
 - Real-world coverage sample (5 apps, real installations, this session):
 
   | App | UIA tree useful? | Notes |
@@ -69,34 +115,51 @@ PASSED — all 4 checkpoints.**
   | Microsoft Teams (Electron/web-hosted) | **Partial** | Outer native shell visible (44 elements to depth 8), but the actual chat CONTENT is not exposed — the tree bottoms out at an empty `RootWebArea` node. Confirms, empirically, the exact concern already on record in `research/stage-1-capture-layer.md` about Chromium's accessibility tree needing `--force-renderer-accessibility` to populate, which the same research log flags as a real CPU-cost tradeoff, not yet decided. |
 
 **Phase 1.4 — Text selection and highlight capture: no-churn and source-honesty
-checkpoints passed; selection-capture-accuracy checkpoint is a scoped, honest
-partial (see below), and only 2 of the blueprint's 4 required apps were
-tested.**
+checkpoints passed; selection-capture-accuracy checkpoint now covers 3 of the
+blueprint's 4 apps, reported honestly rather than forced to a clean number.**
 - Scope note stated explicitly: the blueprint specifies Notepad, WordPad,
-  Excel and the fixture app. This session covered **Notepad and the fixture
-  app only** (time-boxed); WordPad and Excel selection capture is **not yet
-  verified** — an open gap, not a silent skip.
+  Excel and the fixture app. **WordPad is confirmed NOT INSTALLED on this
+  machine** (`where.exe`, direct path checks, and `Get-Command` all come
+  back empty) — Microsoft removed it from Windows in 2024. This is a real
+  gap in what the blueprint's checkpoint can be run against on current
+  Windows, not a skipped test. Notepad, Excel and the fixture app are
+  covered.
 - No-churn check (one `text_selected` event per drag, not a stream):
-  **passed, confirmed stable across 4+ repeat runs.**
+  **passed, confirmed stable across 4+ repeat runs** (one real debounce bug
+  found and fixed along the way — see the bug list below).
 - Source honesty (fallback-path selections labelled `inferred_selection`,
   never mislabelled as an observed TextPattern selection): **passed.**
 - Selection-capture accuracy, split and reported honestly rather than forced
-  to one number: **keyboard selection (Ctrl+A) ~93% (14/15 across 3 runs)**;
-  **mouse-drag selection ~20-40%, inconsistent** — a synthetic-input/
-  hit-testing timing issue against Windows 11 Notepad's WinUI3 rich-text
-  control, not a capture-code defect (every drag that DID register produced
-  the complete, exact, correct text — never a wrong or partial-but-uncaught
-  value).
+  to one number:
+  - **Notepad** — keyboard (Ctrl+A) ~93% (14/15 across 3 runs); mouse-drag
+    ~20-40%, inconsistent. A synthetic-input/hit-testing timing issue
+    against Windows 11 Notepad's WinUI3 rich-text control, not a
+    capture-code defect (every drag that DID register produced the
+    complete, exact, correct text — never wrong or partial-but-uncaught).
+  - **Excel** (formula bar, automation_id `FormulaBar`) — keyboard 17/20
+    (85%) across 4 runs (5/5, 3/5, 4/5, 5/5); **mouse-drag 0/20 (0%) —
+    never registered once**, likely because the drag's start coordinate is
+    computed before typing and no longer aligns with the cursor once the
+    formula bar re-renders the typed text (not further diagnosed).
+  - **Both apps' mouse-drag results reinforce the same open item**: this
+    attribution (synthetic-input artifact, not a capture defect) is
+    plausible and consistent with the evidence, but **not yet confirmed by
+    a real human dragging a real mouse** — see the open item below.
 
-  **⚠️ Open item: this attribution is not yet confirmed.** The ~20-40% mouse-
-  drag figure was produced entirely by scripted `SendInput` synthetic
-  dragging, and the "it's a synthetic-input timing artifact, not a real
-  capture defect" explanation is the most likely one given the evidence
-  (every registered drag captured exact, correct text — never wrong or
-  corrupted), but it has **not been verified with a real human dragging a
-  real mouse**. That verification pass is still needed before this
-  attribution is fully trusted — do not treat mouse-drag selection as
-  "known good" until someone has actually tried it by hand.
+  **⚠️ Open item: partially confirmed by a real human, still not closed.**
+  Both the Notepad (~20-40%) and Excel (0%) mouse-drag figures above were
+  produced entirely by scripted `SendInput` synthetic dragging. The user
+  then ran one real, organic manual test (real mouse, real Notepad,
+  unscripted): typed "hello world" and dragged over it with the mouse
+  several times. **3 of those real drags were captured, each with the
+  exact, correct selected text** (`"hello world"`, `"r"`, `"orld"`), all
+  via the primary `observed` mechanism, none via the weaker fallback. This
+  is a genuinely positive signal for "it's a synthetic-input artifact, not
+  a real capture defect" — but **the exact number of times the user
+  actually attempted a drag during that test was not recorded**, so a real
+  hit rate (captures ÷ attempts) still cannot be computed, and this item
+  stays open until that count is known. Do not yet treat mouse-drag
+  selection as "known good."
 
 ### Real bugs found and fixed this session (Phase 1.3/1.4 implementation)
 
@@ -134,6 +197,46 @@ tested.**
 7. comtypes null-element COM out-parameters are not Python `None` — every
    tree-walk in `uia_client.py` had to be corrected to check truthiness
    (`if elem:`), not `is not None`.
+8. The test driver's foreground-forcing helper (`tests/_win_input.py`,
+   `force_foreground`) taps the Alt key to bypass Windows' anti-focus-
+   stealing lock — which is *also* the shortcut that activates Office's
+   ribbon "KeyTips" overlay, so a following keystroke (e.g. Ctrl+N) got
+   consumed as a KeyTip selector instead of running normally. Found while
+   testing against Excel. Fixed by sending Escape immediately after, which
+   dismisses any such overlay and is harmless when none is showing.
+9. **A real, production data-quality bug**: `field_value_changed`'s typed
+   content was being stored as a comtypes VARIANT's debug repr string
+   (literally `"VARIANT(vt=0x8, 'hello world')"`) instead of the actual
+   text, because the property-changed callback did `str(new_value)`
+   instead of unwrapping via `.value`. Found by reading back a real
+   capture session, not by a scripted test. Fixed in `uia_events.py`;
+   every `field_value_changed` event captured before this fix has the
+   ugly wrapper text in `content.value_readable` in any existing
+   `pulse.db`, not the clean string.
+10. `view_events.py` (the human-readable viewer, not the capture pipeline
+    itself) ordered ALL events by `t_mono_ns`, which the schema is explicit
+    is only valid for ordering *within one session* — a monotonic clock
+    resets on every new capture-host run. Across a `pulse.db` accumulated
+    over many separate runs/days, this could surface an old session's
+    events ahead of ones from minutes ago. Found by checking a real user's
+    live test and getting what looked like the wrong data. Fixed by
+    re-sorting by `t_wall_utc` (the field the schema designates for
+    human/cross-session reading) before display.
+
+### Real, unresolved characteristic found after initially reporting Phase 1.3 as a clean pass
+
+Re-running the content-correctness checkpoint later in the same session,
+on a machine that had become genuinely busy (confirmed via `Get-Counter`:
+63-91% CPU from ordinary concurrent use), it missed 1-2 of the 5 sentinel
+fields in 4 of 5 repeat runs — a real, load-correlated finding, not a
+regression from any code change made this session (confirmed: re-running
+on a quieter system reproduced the original clean 5/5). Root cause:
+`build_context_snapshot`'s 120ms internal budget (Phase 1.3 build step 4)
+truncates the sibling walk earlier under real CPU contention, before
+reaching later-ordered fields. **Not yet fixed.** Does not affect the
+latency-gate finding above, which measures a different thing (end-to-end
+time to the acting element, not neighbourhood-walk completeness) and
+stayed under 150ms throughout this investigation.
 
 ---
 

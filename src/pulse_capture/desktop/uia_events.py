@@ -365,9 +365,16 @@ class UiaResolverThread:
             # unclassified rather than mislabelled as safe. See host.py's
             # module docstring and BUILD-STATUS.md for the scope note this
             # depends on.
+            # Real bug, found by testing against a live capture: `new_value`
+            # arrives as a comtypes VARIANT wrapper, and str(new_value)
+            # returns its debug repr ("VARIANT(vt=0x8, 'hello')"), not the
+            # actual string -- `.value` unwraps it correctly. Falls back to
+            # str() for any non-VARIANT case as a defensive catch-all, not
+            # because one is expected here.
             value_str = None
             with contextlib.suppress(Exception):
-                value_str = str(new_value) if new_value is not None else None
+                if new_value is not None:
+                    value_str = new_value.value if hasattr(new_value, "value") else str(new_value)
             content = {
                 "value_hmac": None,
                 "value_readable": value_str,
@@ -535,7 +542,10 @@ class UiaResolverThread:
         if uc.get_text_pattern(element) is not None:
             return
 
-        text = uc._element_text(element, uc.MAX_CHARS_PER_ELEMENT)
+        # `element` came from element_from_point(), which uses our shared
+        # cache_request, so its properties are already cached -- same
+        # reasoning as build_context_snapshot's fix.
+        text = uc._element_text(element, uc.MAX_CHARS_PER_ELEMENT, use_cache=True)
         if not text:
             return
         # Best-effort and explicitly imperfect: without TextPattern there is

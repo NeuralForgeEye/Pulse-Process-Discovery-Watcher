@@ -303,7 +303,7 @@ section; the headline findings that change the picture in this log:
   `--force-renderer-accessibility` mode, which §5.1 already flagged as a
   real CPU-cost tradeoff. This is no longer a prediction; it is a measured
   result against a real, currently-installed Teams client.
-- **Two real, non-obvious implementation bugs worth recording for anyone
+- **Three real, non-obvious implementation bugs worth recording for anyone
   building on `comtypes` + UI Automation again:**
   1. A DPI-unaware process gets Win32 coordinates virtualized while
      `IUIAutomation::ElementFromPoint` uses real physical coordinates — on
@@ -315,6 +315,74 @@ section; the headline findings that change the picture in this log:
   2. comtypes represents a NULL COM element out-parameter as a non-`None`
      Python object wrapping a null pointer — `is None` checks silently pass
      it through; only a truthiness check (`if elem:`) catches it correctly.
+  3. A test-only finding, but a sharp one: the Alt-tap used to bypass
+     Windows' foreground-stealing lock also activates Office's ribbon
+     "KeyTips" overlay, silently swallowing the next real keystroke sent to
+     an Office app (Ctrl+N was consumed as a KeyTip selector instead of
+     opening a new workbook). Found only by testing against Excel; fixed
+     by sending Escape immediately after the Alt tap.
+- **Phase 1.4 extended to Excel** (formula bar, `FormulaBar` automation ID,
+  which has TextPattern but NOT ValuePattern, so content had to go in via
+  real keystrokes rather than `SetValue()`): keyboard selection 17/20 (85%)
+  across 4 runs; mouse-drag selection **0/20 — never registered once**,
+  a stronger, more clear-cut version of the same mouse-drag unreliability
+  already seen in Notepad. **WordPad could not be tested at all**:
+  confirmed absent from this machine (Microsoft removed it from Windows in
+  2024), not a skipped test.
+- **A real, load-correlated reliability gap found late in the same
+  session, after Phase 1.3 had already been reported as a clean pass —
+  since fixed and confirmed, in a follow-up session.** Re-running the
+  content-correctness checkpoint on a machine that had become genuinely
+  busy (confirmed via `Get-Counter`: 63-91% CPU from ordinary concurrent
+  use, not from Pulse itself) reproduced only 3-4 of 5 sentinel fields in
+  4 of 5 repeat runs; a quieter machine reproduced the original clean 5/5.
+  Root cause: `build_context_snapshot`'s 120ms internal budget truncated
+  the sibling walk earlier under real CPU contention, before reaching
+  later-ordered fields.
+
+  **The fix took three attempts, each measured, not assumed:**
+  1. Batch the neighbourhood walk via UIA's `*BuildCache` tree-walker
+     calls, reusing the acting element's full 9-property/2-pattern cache
+     request (the same caching discipline blueprint step 2 already
+     mandates for the acting element). Fixed completeness (0/122
+     truncations under a real, artificially-induced 74-80% CPU load burst
+     -- a genuine 6-thread PowerShell busy-loop, not a guess) but
+     INCREASED measured end-to-end p95 latency from ~140ms to ~172ms,
+     regressing the separate latency gate.
+  2. Tried a second, deliberately lighter cache request (4 properties + 1
+     pattern) scoped just to this walk. Latency stayed at ~171ms —
+     confirming the cost was the `*BuildCache` mechanism's fixed per-step
+     tax (the accessibility bridge still queries the target app's UI
+     Automation provider for cached data on every node visited, even ones
+     immediately discarded), not the size of what's requested.
+  3. **Landed on**: keep the plain (uncached) walker for stepping --
+     cheap per-step navigation -- and cut the NUMBER of live property
+     calls per sibling instead: a single-property identity check
+     (AutomationId only, replacing a two-property NativeWindowHandle+Name
+     check) and never fetching both Name and Value for the same sibling
+     (whichever supplies usable text is reused as both). Confirmed 5/5
+     sentinel fields across 4 separate runs under the same real 60-80%
+     CPU load burst, plus a clean 5/5 at normal load -- a real, reproduced
+     fix.
+
+  **A second real bug found during attempt 1, worth its own note**:
+  caching a pattern's AVAILABILITY (`AddPattern(ValuePatternId)`) does
+  NOT cache the pattern's own sub-properties -- calling `.CachedValue` on
+  a `GetCachedPattern()` result raised `E_INVALIDARG` until
+  `UIA_ValueValuePropertyId` was added to the cache request as its own
+  property. Not documented in the Microsoft Learn pages read for this
+  log's §2; found only by testing.
+
+  **The latency gate's own re-measurement, on the other hand, was
+  inconclusive** -- re-running it several times immediately after
+  confirming the content-correctness fix produced wildly inconsistent
+  numbers (200.9ms, 2095.4ms, briefly 20028.5ms with real drops) that did
+  not correlate cleanly with measured CPU load, and one run coincided
+  with active memory compression (~900MB) and elevated paging -- most
+  plausibly this session's own accumulated resource footprint after many
+  hours of repeated CaptureHost starts/stops, not a regression from the
+  content-correctness fix (a separate code path). Recorded honestly as
+  **not re-confirmed**, not as "still passing" -- see `plans/BUILD-STATUS.md`.
 
 ---
 
@@ -359,11 +427,34 @@ section; the headline findings that change the picture in this log:
    `window_activated` for rescoping) was applied and re-measured: 4 fresh
    60-second runs all passed comfortably (p95 = 138.4/142.1/129.6/143.9ms,
    zero drops). No C#/FlaUI fallback needed. See §7a for the full numbers.
-7. **Phase 1.4's mouse-drag selection-capture rate (~20-40%) is not yet
-   confirmed as a synthetic-input artifact.** The explanation on record —
-   real hit-testing/timing mismatch between scripted `SendInput` dragging
-   and Windows 11 Notepad's WinUI3 rich-text control, not a capture-code
-   defect — is well-supported (every drag that DID register produced exact,
-   correct text) but has **not been verified with a real human dragging a
-   real mouse**. Needed before this attribution is fully trusted; tracked
-   as an open item in `plans/BUILD-STATUS.md`.
+7. **Phase 1.4's mouse-drag selection-capture rate (Notepad ~20-40%, Excel
+   0%) is not yet confirmed as a synthetic-input artifact.** The
+   explanation on record — real hit-testing/timing mismatch between
+   scripted `SendInput` dragging and each app's own text control, not a
+   capture-code defect — is well-supported (every drag that DID register,
+   in both apps, produced exact, correct text) but has **not been verified
+   with a real human dragging a real mouse**. Needed before this
+   attribution is fully trusted; tracked as an open item in
+   `plans/BUILD-STATUS.md`.
+8. ~~Phase 1.3's content-correctness checkpoint is not reliable under real
+   CPU load.~~ **Resolved.** Root cause was per-sibling live COM call
+   volume, not the budget value itself. Fixed by minimising live property
+   calls per sibling (single-property identity check, never fetching both
+   Name and Value for one sibling); two other approaches were tried and
+   measured first (full and lightened `*BuildCache` batching), both fixed
+   completeness but regressed the latency gate, and were reverted. See
+   §7a for the full three-attempt account and the real bug found along
+   the way (`AddPattern` alone does not cache a pattern's own
+   sub-properties). Confirmed 5/5 across 4 runs under real, artificially-
+   induced 60-80% CPU load.
+9. **The latency gate needs a clean re-measurement.** Re-checking it
+   immediately after confirming item 8's fix produced wildly inconsistent
+   numbers (200.9ms to 20028.5ms, one run with real drops) that did not
+   correlate cleanly with measured CPU, and coincided once with active
+   memory compression and elevated paging -- most plausibly this
+   session's own accumulated footprint after many hours of repeated
+   CaptureHost starts/stops, not a regression from item 8's fix (a
+   separate code path), but this is not proven. The gate's last clean,
+   trustworthy result remains the 4-run table in `plans/BUILD-STATUS.md`
+   (138-144ms) from before this session's changes. Needs re-running on a
+   rested machine before being treated as reconfirmed.

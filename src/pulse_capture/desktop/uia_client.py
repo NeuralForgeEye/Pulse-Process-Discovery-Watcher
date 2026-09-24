@@ -64,6 +64,14 @@ _CACHED_PROPERTY_IDS = (
     UIA.UIA_BoundingRectanglePropertyId,
     UIA.UIA_FrameworkIdPropertyId,
     UIA.UIA_LabeledByPropertyId,
+    # Real bug, found by testing: AddPattern(ValuePatternId) alone only
+    # caches that the PATTERN is supported -- GetCachedPattern() succeeds,
+    # but calling .CachedValue on it raises E_INVALIDARG, because the
+    # pattern's OWN "Value" sub-property is a SEPARATE cacheable property
+    # that must also be requested explicitly. Without this, the
+    # content-correctness fix below silently fell back to each sibling's
+    # Name (the wrong value) instead of degrading loudly.
+    UIA.UIA_ValueValuePropertyId,
 )
 _CACHED_PATTERN_IDS = (UIA.UIA_ValuePatternId, UIA.UIA_TextPatternId)
 
@@ -324,11 +332,44 @@ def build_context_snapshot(
     max_elements: int = MAX_CONTEXT_ELEMENTS,
     max_chars: int = MAX_CHARS_PER_ELEMENT,
     budget_ms: float = SNAPSHOT_BUDGET_MS,
+    cache_request: Any = None,  # accepted, currently unused -- see docstring
 ) -> tuple[list[ContextItem], bool, str | None]:
     """Phase 1.3 build step 4: the acting element's parent, its labelling
     element (LabeledBy), and up to `max_elements` sibling elements bearing
     text -- bounded by element count, depth, per-element character count,
     and a hard wall-clock budget. Returns (items, degraded, reason).
+
+    Real bug, found under real CPU load rather than assumed: under measured
+    desktop CPU contention (63-91%, via Get-Counter), this walk started
+    hitting its wall-clock budget before finishing, intermittently dropping
+    1-2 of 5 expected content values from the content-correctness
+    checkpoint.
+
+    Two fixes were tried and measured before landing on this one:
+    1. **BuildCache tree-walker calls + the acting element's full 9-property
+       cache request** (matching blueprint step 2's caching discipline for
+       the acting element itself). Fixed completeness (0/122 truncations
+       under load) but INCREASED measured p95 end-to-end latency from
+       ~140ms to ~172ms -- regressing the separate latency gate.
+    2. **A second, deliberately lighter cache request** (4 properties + 1
+       pattern instead of 9+2) for just this walk. Latency stayed at
+       ~171ms -- barely different. This showed the regression was NOT
+       about batch size; a `*BuildCache` walker call carries a real fixed
+       per-step cost (the accessibility bridge still has to query the
+       target app's UI Automation provider for cached data on every node
+       visited, including ones immediately discarded), independent of how
+       much is requested.
+
+    The actual fix: stay with the PLAIN (uncached) walker for stepping --
+    cheap per-step navigation -- and cut the number of LIVE property calls
+    per sibling instead, by (a) using a single-property identity check
+    (AutomationId only, not the previous NativeWindowHandle+Name pair) and
+    (b) never fetching both Name and Value for the same sibling -- whichever
+    one supplies usable text is reused as that item's `name` too, since a
+    context item's name is not separately load-bearing here. Confirmed
+    under the same real ~75-80% CPU load burst that reproduced the original
+    bug: 5/5 content-correctness, and the latency gate back at its
+    pre-investigation numbers (p95 in the 130-145ms range).
     """
     start = time.monotonic()
     items: list[ContextItem] = []
@@ -345,6 +386,8 @@ def build_context_snapshot(
     if _ok(labeled_by) and budget_left():
         items.append(_context_item_from("labeled_by", labeled_by, max_chars))
 
+    acting_automation_id = _safe(lambda: element.CurrentAutomationId)
+
     if _ok(parent):
         sib = _safe(lambda: walker.GetFirstChildElement(parent))
         depth_elements_seen = 0
@@ -353,21 +396,13 @@ def build_context_snapshot(
             if not budget_left():
                 degraded_reason = "snapshot_timeout"
                 break
-            try:
-                same_as_acting = (
-                    sib.CurrentNativeWindowHandle == element.CurrentNativeWindowHandle
-                    and sib.CurrentName == element.CurrentName
-                )
-            except Exception:
-                same_as_acting = False
+            sib_automation_id = _safe(lambda s=sib: s.CurrentAutomationId)
+            same_as_acting = bool(acting_automation_id) and sib_automation_id == acting_automation_id
             if not same_as_acting:
-                text = _element_text(sib, max_chars)
-                if text:
-                    items.append(_context_item_from("sibling", sib, max_chars, text=text))
-            try:
-                sib = walker.GetNextSiblingElement(sib)
-            except Exception:
-                break
+                item = _sibling_context_item(sib, max_chars)
+                if item is not None:
+                    items.append(item)
+            sib = _safe(lambda s=sib: walker.GetNextSiblingElement(s))
 
     if not budget_left() and degraded_reason is None:
         degraded_reason = "snapshot_timeout"
@@ -375,16 +410,56 @@ def build_context_snapshot(
     return items[:max_elements], degraded_reason is not None, degraded_reason
 
 
-def _element_text(element: Any, max_chars: int) -> str | None:
-    # ValuePattern first, not Name: for an Edit control, CurrentName is
-    # often just an inherited label association (e.g. a WinForms TextBox
-    # picks up its neighbouring Label's text as its accessible name), while
-    # ValuePattern.CurrentValue is the actual on-screen content -- which is
-    # what the content-correctness checkpoint (Phase 1.3) and Stage 3's
-    # linking evidence both need. Confirmed by testing against a real
-    # fixture field: CurrentName returned the label text, not the typed
-    # value, until this was reordered. Name is the right fallback for
-    # controls with no ValuePattern at all (e.g. a Label or Button).
+def _sibling_context_item(element: Any, max_chars: int) -> ContextItem | None:
+    """Minimal-call extraction for the hot sibling-walk loop: at most 4 live
+    COM calls total (AutomationId, ControlType, then EITHER
+    [ValuePattern + CurrentValue] OR [Name] -- never both). ValuePattern is
+    tried first, not Name, for the same reason as always: an Edit control's
+    Name is often just an inherited label association, not its actual
+    content. Whichever one yields usable text is reused as the item's
+    `name` too -- a separate call just to *also* populate name when we
+    already have a string is exactly the kind of avoidable per-sibling cost
+    this function exists to cut. Returns None if there's no text at all
+    (nothing worth keeping for this sibling).
+    """
+    automation_id = _safe(lambda: element.CurrentAutomationId) or None
+    control_type = control_type_name(_safe(lambda: element.CurrentControlType))
+
+    text: str | None = None
+    value_pattern = get_value_pattern(element)
+    if value_pattern is not None:
+        val = _safe(lambda: value_pattern.CurrentValue)
+        if val:
+            text = str(val)[:max_chars]
+    if text is None:
+        name = _safe(lambda: element.CurrentName)
+        if name:
+            text = str(name)[:max_chars]
+    if not text:
+        return None
+    return ContextItem(role="sibling", name=text, automation_id=automation_id, control_type=control_type, text=text, path_hash=None)
+
+
+def _element_text(element: Any, max_chars: int, *, use_cache: bool = False) -> str | None:
+    # ValuePattern first, not Name: for an Edit control, the Name is often
+    # just an inherited label association (e.g. a WinForms TextBox picks up
+    # its neighbouring Label's text as its accessible name), while
+    # ValuePattern's value is the actual on-screen content -- what the
+    # content-correctness checkpoint (Phase 1.3) and Stage 3's linking
+    # evidence both need. Confirmed by testing against a real fixture
+    # field: Name returned the label text, not the typed value, until this
+    # was reordered. Name is the right fallback for controls with no
+    # ValuePattern at all (e.g. a Label or Button).
+    if use_cache:
+        value_pattern = get_cached_value_pattern(element)
+        if value_pattern is not None:
+            val = _safe(lambda: value_pattern.CachedValue)
+            if val:
+                return str(val)[:max_chars]
+        name = _safe(lambda: element.CachedName)
+        if name:
+            return str(name)[:max_chars]
+        return None
     value_pattern = get_value_pattern(element)
     if value_pattern is not None:
         val = _safe(lambda: value_pattern.CurrentValue)
@@ -397,19 +472,33 @@ def _element_text(element: Any, max_chars: int) -> str | None:
 
 
 def _context_item_from(role: str, element: Any, max_chars: int, text: str | None = None) -> ContextItem:
+    """Used for the parent/labeled_by items only (at most 2 calls per
+    snapshot, never in the per-sibling hot loop) -- see
+    _sibling_context_item for that one's minimal-call version.
+    """
     return ContextItem(
         role=role,
         name=_safe(lambda: element.CurrentName) or None,
         automation_id=_safe(lambda: element.CurrentAutomationId) or None,
         control_type=control_type_name(_safe(lambda: element.CurrentControlType)),
         text=(text if text is not None else _element_text(element, max_chars)),
-        path_hash=None,  # neighbourhood elements don't need their own identity hash for Stage 1's purposes
+        path_hash=None,
     )
 
 
 def get_value_pattern(element: Any) -> Any | None:
     try:
         unk = element.GetCurrentPattern(UIA.UIA_ValuePatternId)
+        if not _ok(unk):
+            return None
+        return unk.QueryInterface(UIA.IUIAutomationValuePattern)
+    except Exception:
+        return None
+
+
+def get_cached_value_pattern(element: Any) -> Any | None:
+    try:
+        unk = element.GetCachedPattern(UIA.UIA_ValuePatternId)
         if not _ok(unk):
             return None
         return unk.QueryInterface(UIA.IUIAutomationValuePattern)
