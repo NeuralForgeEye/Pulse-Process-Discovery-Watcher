@@ -81,6 +81,20 @@ uv run python view_events.py --all                              # include noisy 
 
 ---
 
+## Checking capture health
+
+```
+uv run python capture_health.py
+```
+
+Reports how reliably capture has actually been working on this machine: what fraction of clicks/shortcuts resolved cleanly vs. degraded (element found, but nearby field context was incomplete) vs. dropped (no element resolved at all), latency percentiles, and a per-session breakdown so a specific bad run stands out. Local, single-machine only — see its module docstring for what this is (and isn't) relative to the full fleet-wide monitoring design.
+
+```
+uv run python capture_health.py --session <id-prefix>   # only one capture-host run
+```
+
+---
+
 ## Running the test suite
 
 ```

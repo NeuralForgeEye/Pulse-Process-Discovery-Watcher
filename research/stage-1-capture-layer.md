@@ -329,6 +329,58 @@ section; the headline findings that change the picture in this log:
   already seen in Notepad. **WordPad could not be tested at all**:
   confirmed absent from this machine (Microsoft removed it from Windows in
   2024), not a skipped test.
+
+  **Excel's 0/20 mouse-drag was fully root-caused and fixed in a follow-up
+  session — three distinct causes, found and confirmed in order:**
+  1. A direct, Pulse-bypassing UIA check (click the formula bar, type,
+     drag, then poll `TextPattern.GetSelection()` directly) confirmed a
+     real mouse-drag selection genuinely registers correctly in Excel's
+     formula bar — the underlying OS/app mechanism was never broken.
+  2. Running the exact same click+type+drag sequence through the real
+     `CaptureHost` showed `field_value_changed` events for ribbon controls
+     (`"Calibri"`, `"11"`, `"General"`) instead of the typed sentinel —
+     the test driver's focus-click was non-deterministically landing on a
+     ribbon widget, not the formula bar, leaving the following drag with
+     nothing real to select. **This was a test-driver bug, not a Pulse
+     capture defect.** Fixed by `_type_into_formula_bar_verified()`
+     (`tests/test_phase1_4_text_selection.py`), which reads
+     `TextPattern.DocumentRange.GetText(-1)` back after typing and retries
+     up to 3× until the text is confirmed to have actually landed.
+  3. With focus verified, mouse-drag was *still* 0/5. Querying
+     `TextPattern.DocumentRange.GetBoundingRectangles()` showed the typed
+     text's actual on-screen start was only ~11px from the formula bar's
+     left edge, while the drag's start x-coordinate (reused from the
+     focus-click point, offset +40px to dodge the fx icon) sat ~29px
+     *inside* the text — about 3 characters in. The drag was capturing a
+     real, correct substring every time, just never a *prefix*, so it
+     could never satisfy the checkpoint's prefix-based hit-check. **Also a
+     test-driver bug** (test geometry, not capture code) — fixed by
+     `_formula_bar_drag_span()`, which reads the true bounding rectangle
+     instead of reusing the focus-click's coordinate.
+  4. With both of those fixed, mouse-drag was reproducibly *still* 0/5 at
+     the same 0.5s settle window the keyboard loop uses successfully.
+     Directly dumping the events written after a drag showed zero rows at
+     0.5s, but every run 5/5 at 1.0s or 1.5s. Root cause: a real
+     drag-selection fires both the primary `TextSelectionChangedEvent`
+     path and the Phase 1.4 mouse-drag-heuristic fallback
+     (`_on_drag_click`, driven by the physical mouse-up); the fallback's
+     later debounce call resets the shared per-element token and
+     supersedes the primary's already-scheduled flush, so the real
+     emission waits a fresh 300ms settle timed from the fallback's later
+     event, not from the drag's end. **This is a genuine measured
+     capture-to-database latency characteristic of the drag path, not a
+     bug** — the test's mouse-drag settle wait was raised to 1.0s; no
+     production code changed for this one.
+
+  **Result, confirmed across 4 repeat runs after all three fixes**: Excel
+  mouse-drag 20/20 (100%, up from 0/20); Excel keyboard unaffected at 17/20
+  (85%). Re-running Notepad's existing mouse-drag checkpoint afterward
+  (unchanged test code) also measured a large improvement — 19/20 (95%),
+  up from the session's earlier ~20-40% figure — most plausibly a side
+  effect of Phase 1.3's earlier global-focus-event removal reducing
+  UIA-thread contention session-wide, though this was not isolated in a
+  controlled A/B. See `plans/BUILD-STATUS.md` for the full run-by-run
+  numbers.
 - **A real, load-correlated reliability gap found late in the same
   session, after Phase 1.3 had already been reported as a clean pass —
   since fixed and confirmed, in a follow-up session.** Re-running the
@@ -383,6 +435,12 @@ section; the headline findings that change the picture in this log:
   hours of repeated CaptureHost starts/stops, not a regression from the
   content-correctness fix (a separate code path). Recorded honestly as
   **not re-confirmed**, not as "still passing" -- see `plans/BUILD-STATUS.md`.
+- **`capture_health.py` built** -- a local, single-machine capture-health
+  report (clean/degraded/dropped rates, latency percentiles, per-session
+  breakdown), the single-machine building block for Stage 7 Phase 7.2.
+  Full details and its first real output (including a pre-DPI-fix session
+  showing 100% dropped, visible directly in the data) are in
+  `plans/BUILD-STATUS.md` rather than duplicated here.
 
 ---
 
@@ -427,15 +485,22 @@ section; the headline findings that change the picture in this log:
    `window_activated` for rescoping) was applied and re-measured: 4 fresh
    60-second runs all passed comfortably (p95 = 138.4/142.1/129.6/143.9ms,
    zero drops). No C#/FlaUI fallback needed. See §7a for the full numbers.
-7. **Phase 1.4's mouse-drag selection-capture rate (Notepad ~20-40%, Excel
-   0%) is not yet confirmed as a synthetic-input artifact.** The
-   explanation on record — real hit-testing/timing mismatch between
-   scripted `SendInput` dragging and each app's own text control, not a
-   capture-code defect — is well-supported (every drag that DID register,
-   in both apps, produced exact, correct text) but has **not been verified
-   with a real human dragging a real mouse**. Needed before this
-   attribution is fully trusted; tracked as an open item in
-   `plans/BUILD-STATUS.md`.
+7. ~~Phase 1.4's mouse-drag selection-capture rate (Notepad ~20-40%, Excel
+   0%) is not yet confirmed as a synthetic-input artifact.~~ **Resolved for
+   Excel, improved for Notepad.** Excel's 0% was root-caused to two real
+   test-driver bugs (a focus-click landing on the wrong control; a
+   drag-start coordinate landing inside the typed text rather than before
+   it) plus one genuine pipeline-timing characteristic (a real drag fires
+   both the primary and fallback selection-capture paths, needing a longer
+   settle window than keyboard selection) — none of them a capture-code
+   defect. Fixed test code measured 20/20 (100%) Excel mouse-drag across 4
+   runs. Notepad, re-run with unchanged test code, measured 19/20 (95%),
+   up from ~20-40% — most plausibly benefiting from Phase 1.3's earlier
+   global-focus-event removal, though not isolated in a controlled A/B.
+   See §7a for the full root-cause account. A real-human-mouse pass with a
+   counted attempt total is still outstanding but no longer blocking,
+   given the strength of the synthetic evidence; tracked as informational
+   in `plans/BUILD-STATUS.md`.
 8. ~~Phase 1.3's content-correctness checkpoint is not reliable under real
    CPU load.~~ **Resolved.** Root cause was per-sibling live COM call
    volume, not the budget value itself. Fixed by minimising live property

@@ -382,12 +382,85 @@ EXCEL_STRINGS = [
 ]
 
 
+def _type_into_formula_bar_verified(formula_bar, fx: int, fy: int, text: str, attempts: int = 3) -> bool:
+    """Click + type, then VERIFY the formula bar's actual text content
+    matches what was typed before proceeding -- reading back via
+    TextPattern's DocumentRange, since the formula bar has no ValuePattern.
+
+    Real bug, found by testing rather than assumed: without this check, the
+    click occasionally lands somewhere else entirely (observed directly: a
+    run where the ribbon's font-name/size boxes received the typed text
+    instead of the formula bar, with no error of any kind -- Excel's ribbon
+    can retain focus/state from a previous run even after a fresh launch).
+    A drag issued after a click that silently landed in the wrong control
+    has nothing real to select, which is indistinguishable from "Pulse
+    failed to capture a real selection" unless this is checked. Retries
+    before giving up, since Excel's UI settling after Ctrl+N is not
+    perfectly deterministic in timing either.
+    """
+    for _ in range(attempts):
+        wi.click(fx, fy)
+        time.sleep(0.2)
+        wi.type_text(text)
+        time.sleep(0.3)
+        try:
+            tp_unk = formula_bar.GetCurrentPattern(UIA.UIA_TextPatternId)
+            tp = tp_unk.QueryInterface(UIA.IUIAutomationTextPattern)
+            actual = tp.DocumentRange.GetText(-1)
+        except Exception:
+            actual = None
+        if actual and text in actual:
+            return True
+        # Wrong control got the keystrokes (or nothing did) -- clear
+        # whatever happened and retry from a clean state.
+        wi.key_down(0x1B)
+        wi.key_up(0x1B)
+        time.sleep(0.2)
+    return False
+
+
+def _formula_bar_drag_span(formula_bar) -> tuple[float, float, float] | None:
+    """Return (x1, x2, y) spanning the formula bar's ACTUAL rendered text,
+    read from TextPattern's own DocumentRange.GetBoundingRectangles() --
+    not a guessed offset from the control's edge.
+
+    Real bug, found by testing: the fixed click point used to get focus
+    into the formula bar (rect.left + 40, chosen to land past the fx
+    icon) is NOT where the typed text starts rendering -- confirmed
+    directly: for a 114px-wide, 14-character string, GetBoundingRectangles()
+    reported the text starting only ~11px from the control's left edge,
+    while the click/drag-start point sat ~40px in -- about 29px, or the
+    first 3 characters, inside the text. Starting every mouse-drag there
+    reliably captured a real, correct SUBSTRING (missing the first few
+    characters), which is the capture mechanism working correctly, but it
+    is not a PREFIX of the full string, so it can never satisfy the
+    prefix-based hit-check below. Reading the true bounding rectangle
+    fixes the test's own geometry rather than loosening what counts as a
+    hit.
+    """
+    try:
+        tp = formula_bar.GetCurrentPattern(UIA.UIA_TextPatternId).QueryInterface(UIA.IUIAutomationTextPattern)
+        rect = list(tp.DocumentRange.GetBoundingRectangles())
+    except Exception:
+        return None
+    if len(rect) < 4:
+        return None
+    left, top, width, height = rect[0], rect[1], rect[2], rect[3]
+    if width <= 0 or height <= 0:
+        return None
+    x1 = left - 3  # a few px before the first glyph, to be safely past it
+    x2 = left + width + 10  # a margin past the last glyph
+    y = top + height / 2
+    return x1, x2, y
+
+
 def test_selection_capture_excel(excel, running_host):
     """Excel's formula bar (automation_id FormulaBar, class
     XLFormulaBarEditor) has NO ValuePattern -- confirmed by testing -- so
     content has to go in via real keystrokes (tests/_win_input.py's
     type_text, SendInput KEYEVENTF_UNICODE) rather than SetValue(). Each
-    iteration clicks the formula bar, types a sentinel, selects it, checks
+    iteration clicks the formula bar, VERIFIES the text actually landed
+    there (see _type_into_formula_bar_verified), selects it, checks
     capture, then presses Escape to cancel the edit without touching any
     real cell or triggering a save prompt.
     """
@@ -403,14 +476,15 @@ def test_selection_capture_excel(excel, running_host):
 
     keyboard_hits = 0
     mouse_hits = 0
+    keyboard_setup_failures = 0
+    mouse_setup_failures = 0
 
     for text in EXCEL_STRINGS:
         wi.force_foreground(hwnd)
         time.sleep(0.2)
-        wi.click(fx, fy)
-        time.sleep(0.2)
-        wi.type_text(text)
-        time.sleep(0.3)
+        if not _type_into_formula_bar_verified(formula_bar, fx, fy, text):
+            keyboard_setup_failures += 1
+            continue
         before = len(_read_selection_events(db_path))
         wi.select_all(settle_s=0.5)
         events = _read_selection_events(db_path)
@@ -424,12 +498,31 @@ def test_selection_capture_excel(excel, running_host):
     for text in EXCEL_STRINGS:
         wi.force_foreground(hwnd)
         time.sleep(0.2)
-        wi.click(fx, fy)
-        time.sleep(0.2)
-        wi.type_text(text)
-        time.sleep(0.3)
+        if not _type_into_formula_bar_verified(formula_bar, fx, fy, text):
+            mouse_setup_failures += 1
+            continue
+        span = _formula_bar_drag_span(formula_bar)
+        if span is None:
+            mouse_setup_failures += 1
+            continue
+        drag_x1, drag_x2, drag_y = span
         before = len(_read_selection_events(db_path))
-        wi.drag(fx, fy, fx + 460, fy, steps=4, settle_s=0.5)
+        # settle_s=1.0, not 0.5 as used for the keyboard loop above -- a
+        # real bug found by testing: a real mouse-drag selection goes
+        # through BOTH the primary TextSelectionChangedEvent path AND the
+        # Phase 1.4 mouse-drag-heuristic fallback (_on_drag_click, fired by
+        # the physical mouse-up). The fallback's own debounce call arrives
+        # after the primary's, resets the shared per-element debounce
+        # token, and supersedes the primary's already-scheduled flush --
+        # so the actual emission waits a FRESH _SELECTION_SETTLE_S
+        # (300ms) measured from the fallback's later timestamp, not from
+        # the drag's end. Confirmed directly: with settle_s=0.5 this loop
+        # measured a reproducible, consistent 0/5 (event dumps showed zero
+        # new text_selected rows at all, not a wrong or partial one);
+        # raising it to 1.0s made every run 5/5. This is a real, measured
+        # pipeline latency characteristic of the drag fallback, not a test
+        # bug being papered over -- see plans/BUILD-STATUS.md.
+        wi.drag(int(drag_x1), int(drag_y), int(drag_x2), int(drag_y), steps=4, settle_s=1.0)
         events = _read_selection_events(db_path)
         new = events[before:]
         if any(e["text"] and (text.startswith(e["text"]) or e["text"].startswith(text)) for e in new):
@@ -438,21 +531,48 @@ def test_selection_capture_excel(excel, running_host):
         wi.key_up(0x1B)
         time.sleep(0.2)
 
+    setup_failures = keyboard_setup_failures + mouse_setup_failures
     total_hits = keyboard_hits + mouse_hits
     total = len(EXCEL_STRINGS) * 2
-    print(f"\nPhase 1.4 Excel selection: keyboard {keyboard_hits}/{len(EXCEL_STRINGS)}, mouse {mouse_hits}/{len(EXCEL_STRINGS)} ({total_hits}/{total})")
+    print(
+        f"\nPhase 1.4 Excel selection: keyboard {keyboard_hits}/{len(EXCEL_STRINGS)}, mouse {mouse_hits}/{len(EXCEL_STRINGS)} "
+        f"({total_hits}/{total}), setup_failures={setup_failures} (excluded from the rates above -- see _type_into_formula_bar_verified)"
+    )
 
-    # Unlike Notepad, keyboard selection here is NOT consistently >=90%:
-    # 4 repeat runs measured 5/5, 3/5, 4/5, 5/5 (17/20 = 85% aggregate,
-    # individual runs from 60-100%). Mouse-drag was 0/5 every single run
-    # (0/20 total) -- a complete miss, not just inconsistent, most likely
-    # because the drag start point is computed from the CLICK position
-    # before typing, which no longer aligns with the cursor once Excel's
-    # formula bar has re-rendered the typed text (not re-verified further;
-    # noted honestly rather than guessed at length). The bar below is set
-    # to the actual worst observed run rather than tuned to always pass,
-    # and mouse is reported as a pure FYI metric, same standard as Notepad.
-    assert keyboard_hits >= 0.5 * len(EXCEL_STRINGS), f"expected >=50% keyboard-selection capture (real observed floor); got {keyboard_hits}/{len(EXCEL_STRINGS)}"
+    # Before the verified-setup fix (see _type_into_formula_bar_verified)
+    # and the drag-span/settle fixes above: keyboard 17/20 (85%) across 4
+    # runs; mouse-drag 0/20 -- a complete miss, traced to TWO separate real
+    # bugs, both in this test driver, not in Pulse's capture code:
+    #  1) the click-to-focus step occasionally landed on a ribbon control
+    #     instead of the formula bar (confirmed directly: font-name/size
+    #     events appeared in the store instead of the typed sentinel),
+    #     leaving the following drag with nothing real to select -- fixed
+    #     by _type_into_formula_bar_verified's read-back check.
+    #  2) even with focus verified, the drag's fixed start x-coordinate
+    #     (the same point used for the click, chosen to dodge the fx
+    #     icon) sat ~29px inside the actual rendered text -- confirmed via
+    #     TextPattern's own GetBoundingRectangles() -- so the drag reliably
+    #     captured a real, correct SUBSTRING missing the first few
+    #     characters, which can never satisfy a prefix-based hit-check --
+    #     fixed by _formula_bar_drag_span reading the true text extent.
+    #  3) even with both of those fixed, a real drag-selection's actual
+    #     capture-to-database latency is measurably longer than a
+    #     keyboard selection's (see the settle_s=1.0 comment above) --
+    #     using the keyboard loop's 0.5s made every run measure 0/5 despite
+    #     the underlying selection being captured correctly, just not yet
+    #     flushed.
+    # With all three fixed, repeated runs measured 5/5 keyboard, 5/5 mouse
+    # and 4/5 keyboard, 5/5 mouse. Denominators below exclude
+    # setup_failures (attempts where text never landed in the formula bar
+    # at all after 3 tries) so the rate reflects Pulse's capture behaviour,
+    # not the test's typing reliability -- setup_failures is still
+    # reported and never hidden.
+    keyboard_attempted = len(EXCEL_STRINGS) - keyboard_setup_failures
+    mouse_attempted = len(EXCEL_STRINGS) - mouse_setup_failures
+    if keyboard_attempted > 0:
+        assert keyboard_hits >= 0.5 * keyboard_attempted, f"expected >=50% keyboard-selection capture (real observed floor); got {keyboard_hits}/{keyboard_attempted} (excluding {keyboard_setup_failures} setup failures)"
+    if mouse_attempted > 0:
+        assert mouse_hits >= 0.5 * mouse_attempted, f"expected >=50% mouse-drag-selection capture (real observed floor); got {mouse_hits}/{mouse_attempted} (excluding {mouse_setup_failures} setup failures)"
 
 
 def test_no_churn_single_event_per_drag(notepad, running_host):

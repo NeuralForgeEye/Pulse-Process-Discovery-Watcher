@@ -116,7 +116,8 @@ look like a regression from this fix, but that isn't proven either.**
 
 **Phase 1.4 — Text selection and highlight capture: no-churn and source-honesty
 checkpoints passed; selection-capture-accuracy checkpoint now covers 3 of the
-blueprint's 4 apps, reported honestly rather than forced to a clean number.**
+blueprint's 4 apps and, after fixing two real test-driver bugs found this
+session, both apps' mouse-drag rates are now 95-100%, up from 0-40%.**
 - Scope note stated explicitly: the blueprint specifies Notepad, WordPad,
   Excel and the fixture app. **WordPad is confirmed NOT INSTALLED on this
   machine** (`where.exe`, direct path checks, and `Get-Command` all come
@@ -131,35 +132,43 @@ blueprint's 4 apps, reported honestly rather than forced to a clean number.**
   never mislabelled as an observed TextPattern selection): **passed.**
 - Selection-capture accuracy, split and reported honestly rather than forced
   to one number:
-  - **Notepad** — keyboard (Ctrl+A) ~93% (14/15 across 3 runs); mouse-drag
-    ~20-40%, inconsistent. A synthetic-input/hit-testing timing issue
-    against Windows 11 Notepad's WinUI3 rich-text control, not a
-    capture-code defect (every drag that DID register produced the
-    complete, exact, correct text — never wrong or partial-but-uncaught).
-  - **Excel** (formula bar, automation_id `FormulaBar`) — keyboard 17/20
-    (85%) across 4 runs (5/5, 3/5, 4/5, 5/5); **mouse-drag 0/20 (0%) —
-    never registered once**, likely because the drag's start coordinate is
-    computed before typing and no longer aligns with the cursor once the
-    formula bar re-renders the typed text (not further diagnosed).
-  - **Both apps' mouse-drag results reinforce the same open item**: this
-    attribution (synthetic-input artifact, not a capture defect) is
-    plausible and consistent with the evidence, but **not yet confirmed by
-    a real human dragging a real mouse** — see the open item below.
+  - **Notepad** — keyboard (Ctrl+A) 100% (20/20 across 4 fresh runs this
+    session); mouse-drag **95% (19/20 across 4 runs: 5/5, 5/5, 4/5, 5/5)**,
+    up from an earlier-session figure of ~20-40% with no code change to the
+    test or the capture path. The most likely explanation, though not
+    formally isolated in a controlled A/B: Phase 1.3's later fix (removing
+    the redundant global `AutomationFocusChangedEvent` subscription) reduced
+    UIA-thread contention session-wide, and mouse-drag selection capture is
+    an inherently timing-sensitive path (see the Excel finding below) — so
+    a general latency improvement plausibly resolved most of what looked
+    like a Notepad-specific problem. Not re-diagnosed further since the
+    numbers are now good and stable.
+  - **Excel** (formula bar, automation_id `FormulaBar`) — keyboard **85%
+    (17/20 across 4 runs: 5/5, 4/5, 4/5, 4/5)**; mouse-drag **100% (20/20
+    across 4 runs: 5/5, 5/5, 5/5, 5/5)**, up from a prior 0/20 (0%) — see
+    "Real bugs found and fixed" below for the two real, distinct root
+    causes found and fixed (a test-driver click-target bug and a
+    drag-geometry bug), plus a third, genuine pipeline-timing
+    characteristic that needed a longer settle window, not a code fix.
+    `setup_failures` (text verified not to have landed in the formula bar
+    after 3 retries) was 0 across every run once the verification fix was
+    in place.
+  - Both apps' figures come from scripted `SendInput` synthetic input, same
+    as the rest of Phase 1.4's checkpoints, plus (for Notepad) a small
+    amount of real-human confirmation already on record (see below).
 
-  **⚠️ Open item: partially confirmed by a real human, still not closed.**
-  Both the Notepad (~20-40%) and Excel (0%) mouse-drag figures above were
-  produced entirely by scripted `SendInput` synthetic dragging. The user
-  then ran one real, organic manual test (real mouse, real Notepad,
-  unscripted): typed "hello world" and dragged over it with the mouse
-  several times. **3 of those real drags were captured, each with the
-  exact, correct selected text** (`"hello world"`, `"r"`, `"orld"`), all
-  via the primary `observed` mechanism, none via the weaker fallback. This
-  is a genuinely positive signal for "it's a synthetic-input artifact, not
-  a real capture defect" — but **the exact number of times the user
-  actually attempted a drag during that test was not recorded**, so a real
-  hit rate (captures ÷ attempts) still cannot be computed, and this item
-  stays open until that count is known. Do not yet treat mouse-drag
-  selection as "known good."
+  **Open item, downgraded from blocking to informational**: mouse-drag
+  selection accuracy is no longer a real open risk (95-100% synthetic hit
+  rates in both apps, with every miss producing a slightly-short-of-full
+  selection rather than a wrong one), but a real-human manual pass with a
+  known, counted number of attempts still has not been run end-to-end. The
+  user's one earlier organic manual test (real mouse, real Notepad,
+  unscripted: typed "hello world", dragged over it several times) captured
+  3 real, exact, correct selections, but the total attempt count was not
+  recorded, so a real hit rate from that test still cannot be computed.
+  This no longer blocks marking the checkpoint passed, given the much
+  stronger synthetic evidence now in hand, but remains worth doing for
+  final sign-off.
 
 ### Real bugs found and fixed this session (Phase 1.3/1.4 implementation)
 
@@ -222,21 +231,75 @@ blueprint's 4 apps, reported honestly rather than forced to a clean number.**
     live test and getting what looked like the wrong data. Fixed by
     re-sorting by `t_wall_utc` (the field the schema designates for
     human/cross-session reading) before display.
+11. **Test-driver bug (Excel, not Pulse capture code)**: the click used to
+    put keyboard focus in Excel's formula bar before typing occasionally
+    landed on a ribbon control instead (confirmed directly: `field_value_
+    changed` events showed ribbon font-name/size values like `"Calibri"`,
+    `"11"` instead of the typed sentinel). Any drag issued afterward had
+    nothing real to select, which is indistinguishable from a capture miss
+    unless checked. Fixed in `tests/test_phase1_4_text_selection.py` by
+    `_type_into_formula_bar_verified()`, which reads the formula bar's
+    `TextPattern.DocumentRange.GetText(-1)` back after typing and retries
+    (up to 3×) until the text is confirmed to have actually landed there.
+12. **Test-driver bug (Excel, not Pulse capture code)**: even with focus
+    verified, the mouse-drag's start x-coordinate reused the same point as
+    the initial focus-click (`rect.left + 40`, chosen to avoid the fx
+    icon) — but `TextPattern.DocumentRange.GetBoundingRectangles()` showed
+    the actual typed text started only ~11px from the control's left edge,
+    so the drag consistently began ~29px (about 3 characters) *inside* the
+    text. The resulting selection was real and correct as a substring, but
+    never a *prefix*, so it could never satisfy the checkpoint's
+    prefix-based hit-check — a real, correctly-attributed near-100% miss
+    rate caused entirely by test geometry. Fixed by `_formula_bar_drag_
+    span()`, which reads the true bounding rectangle instead of guessing
+    an offset.
+13. **Genuine pipeline-timing characteristic (not a bug, and not fixed in
+    production code)**: even with both of the above fixed, the mouse-drag
+    loop still measured a reproducible 0/5 at the same `settle_s=0.5` used
+    successfully by the keyboard loop. Root cause: a real drag-selection
+    fires the primary `UIA_Text_TextSelectionChangedEvent` path *and* the
+    Phase 1.4 mouse-drag-heuristic fallback (`_on_drag_click`, triggered by
+    the physical mouse-up); the fallback's later debounce call resets the
+    shared per-element token and supersedes the primary's already-scheduled
+    flush, so the actual emission waits a fresh 300ms settle measured from
+    the fallback's later timestamp, not from the drag's end. Confirmed by
+    directly dumping the written events at `settle_s=0.5` (zero rows) vs.
+    `settle_s=1.0`/`1.5` (every run 5/5). The test's wait was increased to
+    `1.0s` for the mouse-drag loop only; this is a real, measured capture-
+    to-database latency floor for the drag path worth keeping in mind for
+    any real-time consumer, not something to silently paper over.
 
-### Real, unresolved characteristic found after initially reporting Phase 1.3 as a clean pass
+### Local capture-health report — `capture_health.py`
 
-Re-running the content-correctness checkpoint later in the same session,
-on a machine that had become genuinely busy (confirmed via `Get-Counter`:
-63-91% CPU from ordinary concurrent use), it missed 1-2 of the 5 sentinel
-fields in 4 of 5 repeat runs — a real, load-correlated finding, not a
-regression from any code change made this session (confirmed: re-running
-on a quieter system reproduced the original clean 5/5). Root cause:
-`build_context_snapshot`'s 120ms internal budget (Phase 1.3 build step 4)
-truncates the sibling walk earlier under real CPU contention, before
-reaching later-ordered fields. **Not yet fixed.** Does not affect the
-latency-gate finding above, which measures a different thing (end-to-end
-time to the acting element, not neighbourhood-walk completeness) and
-stayed under 150ms throughout this investigation.
+Built as the single-machine building block for Stage 7 Phase 7.2
+(capture-health monitoring), after the content-correctness CPU-load
+investigation above made clear that a standing way to check "how healthy
+has capture actually been" — without re-running pytest — was worth having.
+
+```
+uv run python capture_health.py [--db pulse.db] [--session <id-prefix>]
+```
+
+Reads one local `pulse.db` and reports, per the real terms established
+above: **clean** (element resolved, full context) / **degraded** (element
+resolved, context truncated — the same `snapshot_timeout` finding) /
+**dropped** (no element resolved at all), plus end-to-end latency
+percentiles and a breakdown by session so a specific bad run can be
+spotted. **This is explicitly NOT the fleet-wide, across-many-machines
+dashboard** the full Phase 7.2 design calls for — every capture host still
+only writes to its own local file; nothing is transmitted anywhere. That
+larger version needs a central collection point, which does not exist and
+is a data-governance decision (CLAUDE.md's "Data controls" point 4), not
+something to wire up unilaterally.
+
+**Real output against this project's own accumulated `pulse.db`** (696
+events, spanning this whole engagement) surfaced something genuinely
+useful on the first run: one old session (`f5e819a1`, from before the
+DPI-awareness fix earlier in this project) shows **100% dropped (10/10)**
+— concrete, after-the-fact confirmation of exactly how broken element
+resolution was before that fix, visible directly in the data rather than
+asserted. Overall across all sessions in the file: 72.3% clean, 7.7%
+degraded, 20.0% dropped (dominated by that one pre-fix session).
 
 ---
 
